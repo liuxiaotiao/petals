@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Drive the whole private Qwen swarm over SSH from one control node.
 #
+#   examples/qwen_cluster.sh preflight # check every host can be deployed to, change nothing
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
@@ -24,8 +25,17 @@ BOOTSTRAP_NODE="${BOOTSTRAP_NODE:-N01}"
 DHT_PORT="${DHT_PORT:-31337}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
 MAX_DISK_SPACE="${MAX_DISK_SPACE:-40GB}"
-PY="${PY:-python3.10}"
-TORCH_SPEC="${TORCH_SPEC:-torch==2.2.2}"
+# NODE_PY: an interpreter that already exists on every host (e.g. a conda env with torch).
+# The venv is then built on top of it with --system-site-packages, so torch is inherited
+# and Petals' own pins (transformers==4.43.1, numpy<2, peft, bitsandbytes) land in the venv
+# instead of mutating that environment.
+NODE_PY="${NODE_PY:-}"
+PY="${PY:-python3.10}"                           # only used when NODE_PY is empty
+if [[ -n "$NODE_PY" ]]; then
+  TORCH_SPEC="${TORCH_SPEC-}"                    # inherited from NODE_PY unless set explicitly
+else
+  TORCH_SPEC="${TORCH_SPEC-torch==2.2.2}"
+fi
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu118}"
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"           # Hub download of ~25 GB per host takes a while
 STATE_DIR="${STATE_DIR:-$REPO_ROOT/.qwen-cluster}"
@@ -70,6 +80,51 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
   return $rc
 }
 
+# Everything deploy needs but does not install. Read-only: touches nothing on the hosts.
+cmd_preflight() {
+  local interp="${NODE_PY:-$PY}"
+  echo "Checking ${#IDS[@]} hosts against interpreter: $interp"
+  fanout preflight "
+py=\$('$interp' -c 'import sys; print(\"%d.%d.%d\" % sys.version_info[:3])' 2>/dev/null) || py=MISSING
+if [ \"\$py\" = MISSING ]; then
+  echo '{ID} python=MISSING (interpreter not found: $interp)'
+  exit 1
+fi
+torch=\$('$interp' -c 'import torch; print(torch.__version__)' 2>/dev/null) || torch=MISSING
+gpu=\$('$interp' -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"NO-CUDA\")' 2>/dev/null) || gpu=NO-CUDA
+'$interp' -m venv --help >/dev/null 2>&1 && venv=ok || venv=MISSING
+command -v git >/dev/null && git=ok || git=MISSING
+command -v rsync >/dev/null && rsync=ok || rsync=MISSING
+# Petals pulls hivemind straight from GitHub, so pip needs to reach it from this host.
+if [ \"\$git\" = ok ]; then
+  timeout 25 git ls-remote --exit-code https://github.com/learning-at-home/hivemind.git HEAD >/dev/null 2>&1 \
+    && github=ok || github=UNREACHABLE
+else
+  github=skipped
+fi
+timeout 25 '$interp' -m pip download --no-deps -d /tmp/.qwen-pipcheck packaging >/dev/null 2>&1 \
+  && pypi=ok || pypi=UNREACHABLE
+rm -rf /tmp/.qwen-pipcheck
+disk=\$(df -Pk \"\$HOME\" | awk 'NR==2 {printf \"%.0fG\", \$4/1048576}')
+echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi free=\$disk\"
+case \"\$torch\$venv\$git\$rsync\$github\$pypi\" in *MISSING*|*UNREACHABLE*) exit 1 ;; esac
+" || true
+
+  echo
+  local id bad=0
+  for id in "${IDS[@]}"; do
+    local line; line=$(tail -1 "$STATE_DIR/out/$id.preflight" 2>/dev/null)
+    printf '  %s\n' "${line:-$id no-response}"
+    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" ]] && bad=$((bad + 1))
+  done
+  echo
+  if (( bad )); then
+    echo "$bad host(s) are not ready. Fix those before running deploy." >&2
+    return 1
+  fi
+  echo "All hosts are ready for deploy."
+}
+
 cmd_deploy() {
   command -v rsync >/dev/null || { echo "rsync is required on the control node" >&2; exit 2; }
   mkdir -p "$STATE_DIR/out"
@@ -91,18 +146,30 @@ cmd_deploy() {
   done
   (( rc == 0 )) || return 1
 
-  echo "Building the virtualenv on every host (this pulls torch, expect several minutes) ..."
+  local make_venv torch_step
+  if [[ -n "$NODE_PY" ]]; then
+    make_venv="'$NODE_PY' -m venv --system-site-packages venv"
+    echo "Building a venv on top of $NODE_PY on every host (torch is inherited) ..."
+  else
+    make_venv="$PY -m venv venv"
+    echo "Building the virtualenv on every host (this pulls torch, expect several minutes) ..."
+  fi
+  if [[ -n "$TORCH_SPEC" ]]; then
+    torch_step="venv/bin/pip install -q '$TORCH_SPEC' --index-url '$TORCH_INDEX_URL'"
+  else
+    torch_step="venv/bin/python -c 'import torch' || { echo \"no torch in $NODE_PY\" >&2; exit 1; }"
+  fi
   fanout install "
 set -e
 cd '$REMOTE_DIR'
-test -x venv/bin/python || $PY -m venv venv
+test -x venv/bin/python || $make_venv
 venv/bin/pip install -q --upgrade pip
 venv/bin/pip install -q 'setuptools<81' wheel 'grpcio-tools==1.60.0'
-venv/bin/pip install -q '$TORCH_SPEC' --index-url '$TORCH_INDEX_URL'
+$torch_step
 venv/bin/pip install -q --no-build-isolation -e repo
-venv/bin/python -c 'import petals, torch; print(\"{ID}\", petals.__version__, torch.__version__)'
+venv/bin/python -c 'import petals, torch; print(\"{ID}\", petals.__version__, torch.__version__, torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"NO-CUDA\")'
 "
-  echo "Deployed. Versions:"
+  echo "Deployed. node / petals / torch / GPU:"
   local id
   for id in "${IDS[@]}"; do printf '  %s\n' "$(tail -1 "$STATE_DIR/out/$id.install")"; done
 }
@@ -204,6 +271,7 @@ if [ -f run/dht.pid ]; then kill \$(cat run/dht.pid) 2>/dev/null || true; rm -f 
 }
 
 case "${1:-}" in
+  preflight) shift; cmd_preflight "$@" ;;
   deploy) shift; cmd_deploy "$@" ;;
   start)  shift; cmd_start "$@" ;;
   status) shift; cmd_status "$@" ;;
@@ -211,5 +279,5 @@ case "${1:-}" in
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%s %s %s\n' "${IDS[@]}" | : ; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}"; done ;;
-  *) sed -n '2,12p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,13p' "$0" >&2; exit 2 ;;
 esac

@@ -105,7 +105,10 @@ Hivemind 的旧构建脚本使用 `pkg_resources`，因此这里固定 `setuptoo
 export SSH_USER=ubuntu                 # 各节点的登录用户，需已配好免密公钥
 export MODEL_NAME=Qwen/Qwen3.6-35B-A3B
 export MAX_DISK_SPACE=40GB             # 每台的 Hub 分片缓存上限，见下文磁盘一节
+# 各节点已有的解释器（conda 环境等）。设了它就不再另装 torch。
+export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python
 
+bash examples/qwen_cluster.sh preflight # 只读检查 15 台是否具备部署条件
 bash examples/qwen_cluster.sh deploy   # rsync 本仓库到 15 台，各自建 venv 装依赖
 bash examples/qwen_cluster.sh start    # 起 DHT，抓引导地址，再并发起 15 个服务端
 bash examples/qwen_cluster.sh status --watch   # 轮询到 40 层全覆盖为止
@@ -123,6 +126,49 @@ bash examples/qwen_cluster.sh stop             # 停服务端，再停 DHT
 - **每台的输出留在控制节点** `.qwen-cluster/out/<节点id>.<阶段>`，哪台失败直接看那个文件。
 - 需要覆盖默认值时，设 `DEVICE`、`TORCH_DTYPE`、`NUM_BLOCKS`、`BLOCKS`、
   `BALANCE_QUALITY`、`DHT_PREFIX`、`MODEL_REVISION` 即可，脚本只透传已设置的那些。
+
+### 复用已有的 conda 环境
+
+各节点已经有装好 torch 的环境时，设 `NODE_PY` 指向那个解释器。`deploy` 会用
+`$NODE_PY -m venv --system-site-packages venv` 在它之上建一层 venv：
+
+- **torch 从底层环境继承**，不重复下载（15 台省掉约 40 GB 和十几分钟）。
+- **Petals 自己的 pin 落在 venv 里**，不动底层环境。这点很重要：`setup.cfg` 把
+  transformers 钉死在 4.43.1，还要求 `numpy<2`、`peft==0.8.2`、`bitsandbytes==0.41.1`。
+  直接装进 conda 环境会把这些版本按 Petals 的要求改掉，那个环境里的其他工作可能就跑不了了。
+- 底层环境缺 torch 时 `deploy` 会明确报 `no torch in <解释器路径>` 并把该节点标为 FAIL，
+  不会装到一半留个半残的环境。
+
+`deploy` 结束时每台会打印 `节点 / petals 版本 / torch 版本 / GPU 型号`，
+GPU 不可见的节点显示 `NO-CUDA`——这一步同时充当上真机前的预检。
+
+需要在这层 venv 里另装或覆盖 torch，显式设 `TORCH_SPEC`（和 `TORCH_INDEX_URL`）即可；
+不设 `NODE_PY` 时脚本回退到自建 venv 并按文档的 pin 装 `torch==2.2.2 + cu118`。
+
+### deploy 负责什么、不负责什么
+
+`deploy` 在控制节点一条命令，并行在所有节点上完成：建目录、rsync 代码、
+`$NODE_PY -m venv --system-site-packages venv`、装构建工具、`pip install -e repo`、打印版本与 GPU。
+重复执行是幂等的（venv 已存在就复用）。
+
+它**不负责**的部分，必须事先在各节点就位：
+
+| 前置条件 | 为什么 |
+| --- | --- |
+| `NODE_PY` 指向的解释器存在且能 `import torch` | deploy 只在它之上叠 venv，不会去装 conda 或 torch |
+| 各节点装有 `rsync` | rsync over ssh 要求**两端**都有 |
+| 各节点装有 `git` | `setup.cfg` 里 hivemind 是 `git+https://github.com/...`，pip 要 clone |
+| 各节点能访问 GitHub 和 PyPI | 同上；离线网段会卡在这一步 |
+| 免密 SSH（脚本用 `BatchMode=yes`，不会交互输密码） | 15 台并行时没有输密码的机会 |
+
+`preflight` 把这些逐台查一遍，只读、不改任何东西：
+
+```
+  N01 python=3.10.14 torch=2.4.1+cu121 gpu=NVIDIA A30 venv=ok git=ok rsync=ok github=ok pypi=ok free=210G
+  N12 python=3.10.14 torch=MISSING gpu=NO-CUDA venv=ok git=ok rsync=ok github=UNREACHABLE pypi=ok free=88G
+```
+
+任何一项是 `MISSING` / `UNREACHABLE` 就返回非零并指出有几台不合格，先修好再 `deploy`。
 
 控制节点需要 `rsync` 和到各节点的免密 SSH；不需要装 Petals（覆盖检查是在 N01 上远程跑的）。
 
