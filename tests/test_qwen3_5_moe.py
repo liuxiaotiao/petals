@@ -1,0 +1,408 @@
+"""Small deterministic models; no pretrained weights or public swarm required."""
+import json
+from contextlib import contextmanager
+from unittest.mock import patch
+from types import SimpleNamespace
+from pathlib import Path
+
+import numpy as np
+
+import pytest
+import torch
+from torch import nn
+from transformers import AutoConfig
+
+from petals import AutoDistributedConfig, AutoDistributedModelForCausalLM
+from petals.models.qwen3_5_moe.block import WrappedQwen3_5MoeBlock, cache_specs
+from petals.models.qwen3_5_moe.config import (
+    DHT_PREFIX_SUFFIX,
+    DistributedQwen3_5MoeConfig,
+    default_dht_prefix,
+)
+from petals.models.qwen3_5_moe.model import DistributedQwen3_5MoeForCausalLM
+from petals.models.qwen3_5_moe.ops import Qwen3_5MoeRMSNorm
+from petals.server.backend import TransformerBackend
+from petals.server.block_utils import get_distinct_block_indices, get_model_block
+from petals.utils.convert_block import QuantType, convert_block
+from petals.data_structures import InferenceMetadata
+from petals.utils.misc import DUMMY
+from petals.client.ptune import force_non_empty_weights
+
+
+def tiny_config(**kwargs):
+    text = dict(
+        hidden_size=16,
+        vocab_size=48,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        max_position_embeddings=128,
+        rope_parameters=dict(rope_type="default", rope_theta=10000.0, partial_rotary_factor=0.5),
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        torch_dtype="float32",
+    )
+    text.update(kwargs)
+    return DistributedQwen3_5MoeConfig(text_config=text, dht_prefix="tiny-qwen", use_chunked_forward=False)
+
+
+def random_block(config, index):
+    torch.manual_seed(123 + index)
+    block = get_model_block(config, index).eval()
+    torch.manual_seed(456 + index)  # Independent of HF's no_init_weights loading context.
+    with torch.no_grad():
+        for p in block.parameters():
+            p.uniform_(-0.15, 0.15)
+    return block
+
+
+def allocate(config, block, batch=2, length=20, dtype=torch.float32):
+    # NaNs/sentinels catch reads of uninitialized cache at prefix=0.
+    return [
+        torch.full(shape, float("nan") if dtype.is_floating_point else -777, dtype=dtype)
+        for shape, dtype in cache_specs(config, block.layer_type, batch, length, dtype)
+    ]
+
+
+@pytest.mark.parametrize("index", [0, 3])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_low_precision_cache(index, dtype):
+    c = tiny_config()
+    block = random_block(c, index)
+    x = torch.randn(2, 9, c.hidden_size)
+    expected = block(x)[0]
+    block = block.to(dtype)
+    cache = allocate(c, block, dtype=dtype)
+    first = block.inference_with_cache(x[:, :6].to(dtype), cache, 0, 3)[0]
+    last = block.inference_with_cache(x[:, 6:].to(dtype), cache, 6, 1)[0]
+    tolerance = 0.025 if dtype == torch.bfloat16 else 0.004
+    torch.testing.assert_close(torch.cat((first, last), dim=1).float(), expected, atol=tolerance, rtol=tolerance)
+    if index == 0:
+        assert cache[2].dtype == torch.float32
+
+
+def test_config_registration_and_round_trip(tmp_path):
+    config = tiny_config()
+    config.save_pretrained(tmp_path)
+    reloaded = AutoDistributedConfig.from_pretrained(tmp_path)
+    assert isinstance(AutoConfig.from_pretrained(tmp_path), DistributedQwen3_5MoeConfig)
+    assert reloaded.hidden_size == 16
+    assert reloaded.head_dim == 8
+    assert reloaded.block_prefix == "model.language_model.layers"
+    assert get_model_block(reloaded, 0).layer_type == "linear_attention"
+    assert get_model_block(reloaded, 3).layer_type == "full_attention"
+    migrated = tiny_config(partial_rotary_factor=0.25, rope_parameters={"rope_type": "default", "rope_theta": 10000000})
+    assert migrated.rope_parameters["partial_rotary_factor"] == 0.25
+
+
+@pytest.mark.parametrize("index", [0, 3])
+@pytest.mark.parametrize("length", [7, 67])
+@torch.inference_mode()
+def test_matches_transformers_reference(index, length):
+    c = tiny_config()
+    block = get_model_block(c, index).eval()
+    with np.load(Path(__file__).parent / "data/qwen3_5_moe_reference.npz", allow_pickle=False) as fixture:
+        prefix = f"{index}/weight/"
+        block.load_state_dict(
+            {k[len(prefix) :]: torch.from_numpy(fixture[k]) for k in fixture.files if k.startswith(prefix)}
+        )
+        x = torch.from_numpy(fixture[f"{index}/{length}/input"])
+        expected = torch.from_numpy(fixture[f"{index}/{length}/output"])
+    torch.testing.assert_close(block(x)[0], expected, atol=2e-6, rtol=2e-5)
+    cache = allocate(c, block, length=length)
+    actual = block.inference_with_cache(x[:, :-2], cache, 0, 11)[0]
+    last = block.inference_with_cache(x[:, -2:], cache, length - 2, 1)[0]
+    torch.testing.assert_close(torch.cat((actual, last), dim=1), expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("index", [0, 3])
+@torch.inference_mode()
+def test_chunked_prefill_decode_and_rewind(index):
+    config = tiny_config()
+    block = random_block(config, index)
+    x = torch.randn(2, 12, config.hidden_size)
+    expected = block(x)[0]
+    cache = allocate(config, block)
+    parts = []
+    for start, end in [(0, 5), (5, 6), (6, 9), (9, 12)]:
+        parts.append(block.inference_with_cache(x[:, start:end], cache, start, 2)[0])
+    torch.testing.assert_close(torch.cat(parts, dim=1), expected, atol=2e-6, rtol=2e-5)
+
+    replacement = torch.randn(2, 5, config.hidden_size)
+    expected_branch = block(torch.cat((x[:, :4], replacement), dim=1))[0][:, 4:]
+    actual = block.inference_with_cache(replacement, cache, 4, 2)[0]
+    torch.testing.assert_close(actual, expected_branch, atol=2e-6, rtol=2e-5)
+    # Reset the same allocation to a different prompt.
+    torch.testing.assert_close(block.inference_with_cache(replacement, cache, 0, 3)[0], block(replacement)[0])
+
+
+@pytest.mark.parametrize("index", [0, 3])
+@torch.inference_mode()
+def test_session_isolation_and_batch_reorder(index):
+    c = tiny_config()
+    block = random_block(c, index)
+    first, second = torch.randn(2, 6, 16), torch.randn(2, 6, 16)
+    a, b = allocate(c, block), allocate(c, block)
+    block.inference_with_cache(first[:, :4], a, 0, 3)
+    block.inference_with_cache(second[:, :4], b, 0, 3)
+    for tensor in a:
+        tensor.copy_(tensor[[1, 0]])
+    actual = block.inference_with_cache(first[[1, 0], 4:], a, 4, 3)[0]
+    torch.testing.assert_close(actual, block(first[[1, 0]])[0][:, 4:], atol=2e-6, rtol=2e-5)
+    actual = block.inference_with_cache(second[:, 4:], b, 4, 3)[0]
+    torch.testing.assert_close(actual, block(second)[0][:, 4:], atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("index", [0, 3])
+@torch.inference_mode()
+def test_backend_cache_dispatch(index):
+    from hivemind import BatchTensorDescriptor
+
+    c = tiny_config()
+    original = random_block(c, index)
+    x = torch.randn(2, 7, 16)
+    expected = original(x)[0]
+    block = convert_block(original, index, c, [torch.device("cpu")], torch.device("cpu"), QuantType.NONE)
+    cache = allocate(c, original)
+
+    class Memory:
+        @contextmanager
+        def use_cache(self, *handles):
+            yield cache
+
+    backend = TransformerBackend(
+        "tiny-qwen.0",
+        block,
+        config=c,
+        memory_cache=Memory(),
+        backend_dtype=torch.float32,
+        max_chunk_size_bytes=256,
+        args_schema=(BatchTensorDescriptor(1, 16, dtype=torch.float32),),
+        kwargs_schema={},
+        outputs_schema=(BatchTensorDescriptor(1, 16, dtype=torch.float32),),
+        min_batch_size=1,
+        max_batch_size=32,
+    )
+    try:
+        descriptors = backend.get_inference_cache_descriptors(2, 20)
+        assert [(tuple(d.shape), d.dtype) for d in descriptors] == [(tuple(t.shape), t.dtype) for t in cache]
+        first = backend.inference_step(x[:, :4], DUMMY.to(torch.int64), InferenceMetadata("tiny-qwen.0", 0, (), ""))[0]
+        last = backend.inference_step(x[:, 4:], DUMMY.to(torch.int64), InferenceMetadata("tiny-qwen.0", 4, (), ""))[0]
+        torch.testing.assert_close(torch.cat((first, last), dim=1), expected, atol=2e-6, rtol=2e-5)
+    finally:
+        backend.shutdown()
+
+
+@pytest.mark.parametrize("inference_only", [False, True])
+@torch.inference_mode()
+def test_inference_only_drops_the_backward_pool(inference_only):
+    from hivemind import BatchTensorDescriptor
+
+    from petals.server.handler import TransformerConnectionHandler
+
+    c = tiny_config()
+    block = convert_block(random_block(c, 0), 0, c, [torch.device("cpu")], torch.device("cpu"), QuantType.NONE)
+    descriptor = BatchTensorDescriptor(1, 16, dtype=torch.float32)
+    backend = TransformerBackend(
+        "tiny-qwen.0",
+        block,
+        config=c,
+        memory_cache=None,
+        backend_dtype=torch.float32,
+        max_chunk_size_bytes=256,
+        inference_only=inference_only,
+        args_schema=(descriptor,),
+        kwargs_schema={},
+        outputs_schema=(descriptor,),
+        min_batch_size=1,
+        max_batch_size=32,
+    )
+    try:
+        pools = backend.get_pools()
+        assert (backend.backward_pool in pools) is not inference_only
+        assert backend.forward_pool in pools and backend.inference_pool in pools
+    finally:
+        backend.shutdown()
+
+    # The handler refuses the RPC that training needs, and only that one.
+    reject = TransformerConnectionHandler._reject_if_inference_only
+    handler = SimpleNamespace(inference_only=inference_only)
+    if inference_only:
+        with pytest.raises(RuntimeError, match="inference_only"):
+            reject(handler, "rpc_backward")
+    else:
+        assert reject(handler, "rpc_backward") is None
+
+
+def test_dtype_alias_is_never_dropped_silently():
+    # Transformers 5 renamed torch_dtype to dtype; the Hub config may carry either name.
+    assert DistributedQwen3_5MoeConfig(dht_prefix="x", dtype="float16").torch_dtype == torch.float16
+    assert DistributedQwen3_5MoeConfig(dht_prefix="x", torch_dtype="float16").torch_dtype == torch.float16
+    assert DistributedQwen3_5MoeConfig(dht_prefix="x", dtype="float16", torch_dtype="float16").torch_dtype == (
+        torch.float16
+    )
+    assert DistributedQwen3_5MoeConfig(dht_prefix="x").torch_dtype == torch.bfloat16
+    with pytest.raises(ValueError, match="Conflicting dtype"):
+        DistributedQwen3_5MoeConfig(dht_prefix="x", dtype="float16", torch_dtype="float32")
+
+
+def test_default_dht_prefix_is_usable_as_a_dht_key(tmp_path):
+    from petals.data_structures import CHAIN_DELIMITER, UID_DELIMITER
+
+    prefix = default_dht_prefix("Qwen/Qwen3.6-35B-A3B")
+    # The account is dropped so copies of one checkpoint served by different accounts merge.
+    assert prefix == "Qwen3-6-35B-A3B" + DHT_PREFIX_SUFFIX
+    # Server.__init__ rejects prefixes containing these, and a "/" would split the key.
+    assert UID_DELIMITER not in prefix and CHAIN_DELIMITER not in prefix and "/" not in prefix
+    assert default_dht_prefix(tmp_path / "Qwen3.6-local") == "Qwen3-6-local" + DHT_PREFIX_SUFFIX
+    config = tiny_config()
+    config.save_pretrained(tmp_path / "Qwen3.6-local")
+    assert AutoDistributedConfig.from_pretrained(tmp_path / "Qwen3.6-local").dht_prefix == default_dht_prefix(
+        tmp_path / "Qwen3.6-local"
+    )
+
+
+def test_every_block_variant_is_probed():
+    config = tiny_config()
+    indices = get_distinct_block_indices(config)
+    # Size and throughput estimates must see the linear and the full attention layer.
+    assert {config.layer_types[index] for index in indices} == set(config.layer_types)
+    assert len(indices) == 2
+    # Models with uniform blocks keep the previous single-probe behaviour.
+    assert get_distinct_block_indices(SimpleNamespace()) == [0]
+    assert get_distinct_block_indices(SimpleNamespace(layer_types=["full_attention"] * 4)) == [0]
+
+
+@torch.inference_mode()
+def test_rotary_cache_survives_growth_and_reuse():
+    config = tiny_config(max_position_embeddings=1024)
+    block = random_block(config, 3)  # Full attention: the only layer type that uses RoPE.
+    attention = block.self_attn
+    length = 300  # Longer than ROPE_CACHE_MIN_LENGTH, so the table has to grow at least once.
+    x = torch.randn(2, length, config.hidden_size)
+    expected = block(x)[0]
+
+    cache = allocate(config, block, length=length)
+    parts = [
+        block.inference_with_cache(x[:, :250], cache, 0, 64)[0],
+        block.inference_with_cache(x[:, 250:], cache, 250, 64)[0],
+    ]
+    torch.testing.assert_close(torch.cat(parts, dim=1), expected, atol=2e-6, rtol=2e-5)
+
+    assert len(attention._rope_cache) == 1  # One (device, dtype, dim) key, not one table per call.
+    table = next(iter(attention._rope_cache.values()))
+    block(x[:, :8])
+    assert next(iter(attention._rope_cache.values())) is table  # Reused, not rebuilt.
+    # A second dtype gets its own table instead of reusing the float32 rows.
+    block.to(torch.float16)(x[:, :4].to(torch.float16))
+    assert len(attention._rope_cache) == 2
+
+
+def test_unsupported_modes_fail():
+    c = tiny_config()
+    with pytest.raises(ValueError, match="prequantized"):
+        tiny_config(quantization_config={"quant_method": "fp8"})
+    with pytest.raises(ValueError, match="RoPE"):
+        tiny_config(rope_parameters={"rope_type": "yarn"})
+    with pytest.raises(ValueError, match="quant_type none"):
+        convert_block(random_block(c, 0), 0, c, [torch.device("cpu")], torch.device("cpu"), QuantType.NF4)
+
+
+class LocalLayers(nn.Module):
+    """Exercise the real HF client/loading/generation interface without network I/O."""
+
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        # Keep these out of the client state_dict, like RemoteSequential.
+        with force_non_empty_weights():
+            self.__dict__["blocks"] = [random_block(config, i) for i in range(config.num_hidden_layers)]
+        self.active_session = None
+
+    @property
+    def position(self):
+        return 0 if self.active_session is None else self.active_session.position
+
+    @contextmanager
+    def use_session(self, session):
+        previous, self.active_session = self.active_session, session
+        try:
+            yield session
+        finally:
+            self.active_session = previous
+
+    @contextmanager
+    def inference_session(self, max_length):
+        session = SimpleNamespace(position=0, output_ids=None, caches=None, max_length=max_length)
+        with self.use_session(session):
+            yield session
+
+    def forward(self, hidden_states, **kwargs):
+        if self.active_session is not None:
+            session = self.active_session
+            if session.caches is None:
+                session.caches = [
+                    allocate(b.config, b, hidden_states.shape[0], session.max_length) for b in self.blocks
+                ]
+            for block, cache in zip(self.blocks, session.caches):
+                hidden_states = block.inference_with_cache(hidden_states, cache, session.position, 3)[0]
+            session.position += hidden_states.shape[1]
+            return hidden_states
+        for block in self.blocks:
+            hidden_states = block(hidden_states)[0]
+        return hidden_states
+
+
+@torch.inference_mode()
+def test_client_checkpoint_layout_and_logits(tmp_path):
+    c = tiny_config()
+    with patch("petals.models.qwen3_5_moe.model.RemoteSequential", LocalLayers):
+        model = DistributedQwen3_5MoeForCausalLM(c).eval()
+        state = model.state_dict()
+        assert set(state) == {
+            "model.language_model.embed_tokens.weight",
+            "model.language_model.norm.weight",
+            "lm_head.weight",
+        }
+        with torch.no_grad():
+            model.transformer.norm.weight.uniform_(-0.2, 0.2)
+            model.lm_head.weight.normal_(std=0.1)
+        ids = torch.tensor([[1, 7, 3, 6]])
+        hidden = model.get_input_embeddings()(ids)
+        for block in model.transformer.layers.blocks:
+            hidden = block(hidden)[0]
+        expected = model.lm_head(model.transformer.norm(hidden)).float()
+        torch.testing.assert_close(model(ids).logits, expected)
+        model.save_pretrained(tmp_path)
+        loaded = AutoDistributedModelForCausalLM.from_pretrained(tmp_path)
+        torch.testing.assert_close(loaded(ids).logits, expected)
+        with pytest.raises(ValueError, match="beam"):
+            model.generate(ids, max_new_tokens=2, num_beams=2)
+
+
+@torch.inference_mode()
+def test_client_generate_and_resume():
+    with patch("petals.models.qwen3_5_moe.model.RemoteSequential", LocalLayers):
+        model = DistributedQwen3_5MoeForCausalLM(tiny_config()).eval()
+        model.lm_head.weight.normal_(std=0.1)
+        ids = torch.tensor([[1, 7, 3, 6]])
+        expected = ids.clone()
+        for _ in range(5):
+            expected = torch.cat((expected, model(expected).logits[:, -1].argmax(-1, keepdim=True)), dim=1)
+        actual = model.generate(ids, max_new_tokens=5, do_sample=False, eos_token_id=None)
+        torch.testing.assert_close(actual, expected)
+        with model.inference_session(max_length=16):
+            a = model.generate(ids, max_new_tokens=2, do_sample=False, eos_token_id=None)
+            b = model.generate(max_new_tokens=3, do_sample=False, eos_token_id=None)
+        torch.testing.assert_close(torch.cat((a, b), dim=1), expected)
