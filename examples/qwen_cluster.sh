@@ -1295,9 +1295,25 @@ $SYSTEMD_ENV
 # counter is cleared. Without this, 'service start' silently does nothing on exactly the
 # hosts that need it most.
 systemctl --user reset-failed $SERVICE_NAME.service >/dev/null 2>&1 || true
-if [ -f '$REMOTE_DIR/run/server.pid' ] && ! systemctl --user is-active --quiet $SERVICE_NAME 2>/dev/null; then
-  kill \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null || true
-  sleep 5
+# A server started outside systemd must be gone before the unit starts, and gone means
+# gone: these processes do not reliably die on SIGTERM, and one that survives keeps its
+# GPU memory, so the unit OOMs on load, restarts, and OOMs again forever. Wait for it,
+# then stop asking nicely.
+if ! systemctl --user is-active --quiet $SERVICE_NAME 2>/dev/null; then
+  venv_python=\"\$HOME/$REMOTE_DIR/venv/bin/python\"
+  [ -f '$REMOTE_DIR/run/server.pid' ] && kill \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null || true
+  waited=0
+  while [ \$waited -lt 60 ]; do
+    alive=\$(pgrep -f \"\$venv_python -m petals\\.cli\\.run_server\" 2>/dev/null | grep -vx \"\$\$\" | head -1)
+    [ -z \"\$alive\" ] && break
+    sleep 2; waited=\$(( waited + 2 ))
+  done
+  for pid in \$(pgrep -f \"\$venv_python -m petals\\.cli\\.run_server\" 2>/dev/null); do
+    [ \"\$pid\" = \"\$\$\" ] && continue
+    kill -9 \"\$pid\" 2>/dev/null || true
+  done
+  rm -f '$REMOTE_DIR/run/server.pid'
+  sleep 2
 fi
 systemctl --user $action $SERVICE_NAME.service 2>&1 | tail -2
 systemctl --user is-active $SERVICE_NAME.service 2>/dev/null || true
