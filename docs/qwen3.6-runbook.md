@@ -101,6 +101,12 @@ bash examples/qwen_cluster.sh start
 代理的客户端白名单是从 `HOSTS_FILE` 生成的,拿分批文件去起代理,
 第二批那 9 台会被自己的代理拒之门外。
 
+分批文件**不需要**包含 `BOOTSTRAP_NODE`。缺了的话,地址从 `.qwen-cluster/bootstrap_peer`
+里取,并且假定那个 DHT 已经在跑(缓存存在本身就说明它起过)。
+
+`stop` 配分批文件用是安全的:它默认不动 bootstrap DHT。想连 DHT 一起停,要显式
+`stop --dht`——那会把整个 swarm 停掉,包括这个文件里没列的节点。
+
 ---
 
 ## 3. 客户端
@@ -139,7 +145,7 @@ python examples/qwen_generate.py \
 | `cleanup [--ours\|--gpu] [--yes]` | 列出/清理残留进程。默认只列不杀 |
 | `synctime [--yes]` | 看时钟偏差。全部 NTP 同步时会拒绝 `--yes` |
 | `hosts` | 打印解析出来的节点表 |
-| `stop` | 停所有服务端,再停 DHT。bootstrap 身份保留,下次 `start` 地址不变 |
+| `stop [--dht]` | 停 `HOSTS_FILE` 里那些服务端。**默认不碰 bootstrap DHT**——停它等于停掉整个 swarm,包括当前 hosts 文件里没列的那些。`--dht` 才一并停 |
 
 ---
 
@@ -231,8 +237,10 @@ bash examples/qwen_cluster.sh diag
 ## 6. 停止
 
 ```bash
-bash examples/qwen_cluster.sh stop        # 服务端 + DHT
+bash examples/qwen_cluster.sh stop --dht  # 所有服务端 + bootstrap DHT
 bash examples/qwen_cluster.sh proxy stop  # 代理
 ```
+
+不加 `--dht` 只停服务端,DHT 留着——想重起服务端而不打扰整个 swarm 时用这个。
 
 bootstrap 的身份文件保留,下次 `start` 的 peer 地址不变,客户端不用改。

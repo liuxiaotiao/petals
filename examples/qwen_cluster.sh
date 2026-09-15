@@ -16,7 +16,8 @@
 #   examples/qwen_cluster.sh cleanup --ours --yes   # kill this deployment's leftovers
 #   examples/qwen_cluster.sh cleanup --gpu  --yes   # ALSO kill other processes on the GPU
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
-#   examples/qwen_cluster.sh stop      # stop servers, then the DHT
+#   examples/qwen_cluster.sh stop      # stop the servers in HOSTS_FILE; leaves the DHT up
+#   examples/qwen_cluster.sh stop --dht  # also stop the bootstrap DHT (takes the whole swarm down)
 #
 # CLEANUP_ON_START=gpu makes 'start' first kill every foreign process holding GPU
 # memory. Only set it where this cluster owns the GPUs outright.
@@ -76,10 +77,30 @@ while read -r id addr extra _rest; do
 done < <(sed 's/#.*//' "$HOSTS_FILE")
 (( ${#IDS[@]} )) || { echo "No hosts parsed from $HOSTS_FILE" >&2; exit 2; }
 
-index_of() {
+# Returns non-zero instead of aborting: a subset HOSTS_FILE legitimately omits nodes that
+# some commands still need to reach, and those can fall back rather than refuse to run.
+find_index() {
   local want="$1" i
-  for i in "${!IDS[@]}"; do [[ "${IDS[$i]}" == "$want" ]] && { echo "$i"; return; }; done
-  echo "Unknown node id: $want" >&2; exit 2
+  for i in "${!IDS[@]}"; do [[ "${IDS[$i]}" == "$want" ]] && { echo "$i"; return 0; }; done
+  return 1
+}
+
+index_of() {
+  local i
+  i=$(find_index "$1") || { echo "Unknown node id: $1" >&2; exit 2; }
+  echo "$i"
+}
+
+# The bootstrap node's address, even when this HOSTS_FILE does not list it. Restarting a
+# few hosts from a subset file is a normal thing to do, and it should not require listing
+# the bootstrap node just so its address can be looked up: the cached peer multiaddr
+# already carries it, and its presence means that DHT is the one already running.
+bootstrap_ip() {
+  local i
+  if i=$(find_index "$BOOTSTRAP_NODE"); then printf '%s\n' "${IPS[$i]}"; return 0; fi
+  local ip; ip=$(sed -n 's|^/ip4/\([0-9.]*\)/.*|\1|p' "$PEER_FILE" 2>/dev/null | head -1)
+  [[ -n "$ip" ]] || return 1
+  printf '%s\n' "$ip"
 }
 
 remote() {  # remote <ip> <shell-command>
@@ -152,7 +173,8 @@ measure_skew() {
     if [[ -n "$offset" ]]; then src+=("ntp"); else src+=("rtt"); fi
   done
 
-  local bi; bi=$(index_of "$BOOTSTRAP_NODE")
+  local bi
+  bi=$(find_index "$BOOTSTRAP_NODE") || bi=0   # subset file: any host serves as the reference
   SKEWS=(); SKEW_SRC=(); SKEW_ERR=()
   for i in "${!IDS[@]}"; do
     # Daemon offsets are in the true-time frame and round-trip estimates are in the control
@@ -183,7 +205,8 @@ cmd_synctime() {
   done
 
   measure_skew
-  local i bi; bi=$(index_of "$BOOTSTRAP_NODE")
+  local i bi
+  bi=$(find_index "$BOOTSTRAP_NODE") || bi=0
   local synced=0 known=0
   printf '%-5s %-16s %-12s %s\n' NODE ADDRESS "skew vs $BOOTSTRAP_NODE" measured-by
   for i in "${!IDS[@]}"; do
@@ -516,8 +539,15 @@ cmd_start() {
     cmd_cleanup --gpu --yes
   fi
 
-  local b; b=$(index_of "$BOOTSTRAP_NODE")
-  local bip="${IPS[$b]}"
+  local bip
+  bip=$(bootstrap_ip) || {
+    echo "$BOOTSTRAP_NODE is not in $HOSTS_FILE and no address is cached in $PEER_FILE." >&2
+    echo "Start the full cluster once, or add $BOOTSTRAP_NODE to this hosts file." >&2
+    exit 2
+  }
+  if ! find_index "$BOOTSTRAP_NODE" >/dev/null; then
+    echo "$BOOTSTRAP_NODE is not in $HOSTS_FILE; using its cached address $bip and assuming its DHT is up."
+  fi
 
   echo "Starting the DHT bootstrap on $BOOTSTRAP_NODE ($bip:$DHT_PORT) ..."
   remote "$bip" "
@@ -668,7 +698,7 @@ cmd_status() {
   }
   local watch=0
   [[ "${1:-}" == "--watch" ]] && watch=1
-  local b; b=$(index_of "$BOOTSTRAP_NODE")
+  local bip; bip=$(bootstrap_ip) || { echo "Cannot locate $BOOTSTRAP_NODE." >&2; exit 2; }
   local deadline=$(( $(date +%s) + READY_TIMEOUT ))
 
   # Both halves are polled together: the DHT says which layers are claimed, the hosts say
@@ -678,7 +708,7 @@ cmd_status() {
     status_hosts
     echo
     local rc=0
-    remote "${IPS[$b]}" "cd '$REMOTE_DIR/repo' && \"\$HOME/$REMOTE_DIR/venv/bin/python\" \
+    remote "$bip" "cd '$REMOTE_DIR/repo' && \"\$HOME/$REMOTE_DIR/venv/bin/python\" \
       examples/check_qwen_swarm.py --initial-peers '$peer' --model '$MODEL_NAME'" || rc=$?
     (( watch )) || return "$rc"
     (( rc == 0 )) && return 0
@@ -720,10 +750,10 @@ echo \"{ID} \$alive cache=\${cache:-0} lines=\$lines age=\$age | \${last:-no err
   done
   # Every server depends on the bootstrap DHT, so when nothing is online this is the
   # first thing to rule out. diag used to only read server logs and miss it entirely.
-  local b; b=$(index_of "$BOOTSTRAP_NODE")
+  local bip; bip=$(bootstrap_ip) || bip=""
   echo
-  echo "bootstrap DHT on $BOOTSTRAP_NODE (${IPS[$b]}:$DHT_PORT):"
-  remote "${IPS[$b]}" "
+  echo "bootstrap DHT on $BOOTSTRAP_NODE (${bip:-unknown}:$DHT_PORT):"
+  [[ -n "$bip" ]] && remote "$bip" "
 cd '$REMOTE_DIR' 2>/dev/null || { echo '  no $REMOTE_DIR on this host'; exit 0; }
 if [ -f run/dht.pid ] && kill -0 \$(cat run/dht.pid) 2>/dev/null; then state=running; else state=DEAD; fi
 listening=no
@@ -871,8 +901,7 @@ read_bootstrap_peer() {
     peer=$(cat "$PEER_FILE" 2>/dev/null || true)
     if [[ -n "$peer" ]]; then printf '%s\n' "$peer"; return 0; fi
   fi
-  local b; b=$(index_of "$BOOTSTRAP_NODE")
-  local bip="${IPS[$b]}"
+  local bip; bip=$(bootstrap_ip) || return 1
   while :; do
     peer=$(remote "$bip" \
       "grep -ao '/ip4/${bip//./\\.}/tcp/$DHT_PORT/p2p/[A-Za-z0-9]*' '$REMOTE_DIR/logs/dht.log' 2>/dev/null | head -1" \
@@ -966,15 +995,28 @@ fi
 }
 
 cmd_stop() {
+  local with_dht=0
+  [[ "${1:-}" == --dht || "${1:-}" == --all ]] && with_dht=1
   echo "Stopping servers ..."
   fanout stop "
 cd '$REMOTE_DIR' 2>/dev/null || exit 0
 if [ -f run/server.pid ]; then kill \$(cat run/server.pid) 2>/dev/null || true; rm -f run/server.pid; fi
 echo stopped {ID}
 " || true
-  local b; b=$(index_of "$BOOTSTRAP_NODE")
+  if (( ! with_dht )); then
+    echo
+    echo "Servers stopped. The bootstrap DHT on $BOOTSTRAP_NODE is still running:"
+    echo "stopping it takes down every server in the swarm, including any this hosts file"
+    echo "does not list. Use 'stop --dht' when that is what you mean."
+    return 0
+  fi
+
+  local bip; bip=$(bootstrap_ip) || {
+    echo "Cannot locate $BOOTSTRAP_NODE; the DHT was left running." >&2
+    return 0
+  }
   echo "Stopping the DHT on $BOOTSTRAP_NODE ..."
-  remote "${IPS[$b]}" "
+  remote "$bip" "
 cd '$REMOTE_DIR' 2>/dev/null || exit 0
 if [ -f run/dht.pid ]; then kill \$(cat run/dht.pid) 2>/dev/null || true; rm -f run/dht.pid; fi
 " || true
