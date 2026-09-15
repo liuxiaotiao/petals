@@ -139,7 +139,14 @@ except Exception as exc:
 # With HF_HUB_DISABLE_XET set, downloads fall back to the regular CDN and xethub is
 # irrelevant, so probing it would only produce a blocker that is already handled.
 xet = "disabled" if os.environ.get("QWEN_SKIP_XET") else probe("https://cas-server.xethub.hf.co")
-print("hub=%s xet=%s vram_free=%s" % (probe("https://huggingface.co/api/models"), xet, free))
+# huggingface.co only serves metadata. With Xet off the bytes come from a CDN host on a
+# different domain, which an allowlist that only knows huggingface.co will not permit --
+# the servers then sit in a retry loop with an empty cache instead of failing.
+cdn = probe("https://us.aws.cdn.hf.co")
+if cdn != "ok":
+    cdn = probe("https://cdn-lfs.huggingface.co")
+print("hub=%s cdn=%s xet=%s vram_free=%s" % (
+    probe("https://huggingface.co/api/models"), cdn, xet, free))
 PROBE
 )
 
@@ -223,6 +230,9 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     echo "$bad host(s) are not ready. Fix those before running deploy." >&2
     echo "  CLOCK-SKEW  -> hivemind drops peers >3s apart; sync NTP (chrony / systemd-timesyncd)" >&2
     echo "  xet=UNREACHABLE -> export HF_HUB_DISABLE_XET=1 and re-run; that makes this check pass" >&2
+    echo "  cdn=UNREACHABLE -> weights cannot be downloaded at all: allow *.cdn.hf.co and" >&2
+    echo "                     cdn-lfs*.huggingface.co, set HF_ENDPOINT to a mirror, or" >&2
+    echo "                     pre-seed the cache from a host whose egress works" >&2
     echo "  vram_free=ERR-* -> CUDA context could not be created; the GPU is full or wedged" >&2
     echo "  (clock-marginal is a warning only and does not block deploy)" >&2
     return 1
@@ -298,6 +308,12 @@ cmd_start() {
 set -e
 cd '$REMOTE_DIR'
 if [ -f run/dht.pid ] && kill -0 \$(cat run/dht.pid) 2>/dev/null; then echo already-running; exit 0; fi
+# The pidfile can be lost while the process lives on. Starting a second one then fails
+# to bind the port and dies, leaving a confusing pair, so adopt the survivor instead.
+# The launch line below uses a relative path, so match that form; grep -vx drops this
+# very shell, whose own command line contains the launch line as literal text.
+orphan=\$(pgrep -f \"venv/bin/python -m petals\\.cli\\.run_dht\" 2>/dev/null | grep -vx \"\$\$\" | head -1)
+if [ -n \"\$orphan\" ]; then echo \"\$orphan\" > run/dht.pid; echo adopted-orphan; exit 0; fi
 nohup venv/bin/python -m petals.cli.run_dht \
   --host_maddrs /ip4/0.0.0.0/tcp/$DHT_PORT \
   --announce_maddrs /ip4/$bip/tcp/$DHT_PORT \
