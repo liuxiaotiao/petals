@@ -584,25 +584,84 @@ echo started {ID}
   echo "  examples/qwen_cluster.sh status --watch"
 }
 
+# Report each host's process state and how fast its weight cache is growing.
+#
+# "JOINING" is indistinguishable from "wedged" without this. A 35B model over one shared
+# uplink stays in JOINING for a long time legitimately, so the question that matters is
+# not what state a server is in but whether its cache moved since the last look.
+status_hosts() {
+  fanout hoststate "
+if [ -f '$REMOTE_DIR/run/server.pid' ] && kill -0 \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null
+then state=up; else state=DOWN; fi
+bytes=\$(du -sb '$REMOTE_DIR/cache' 2>/dev/null | cut -f1)
+echo \"\$state \${bytes:-0}\"
+" >/dev/null 2>&1 || true
+
+  local now; now=$(date +%s)
+  mkdir -p "$STATE_DIR/cache_prev"
+  printf '%-5s %-16s %-6s %-11s %-9s %s\n' NODE ADDRESS PORT PROCESS CACHE RATE
+  local i
+  for i in "${!IDS[@]}"; do
+    local id="${IDS[$i]}" line state bytes
+    line=$(tail -1 "$STATE_DIR/out/$id.hoststate" 2>/dev/null || true)
+    state=$(awk '{print $1}' <<<"$line"); bytes=$(awk '{print $2}' <<<"$line")
+    [[ "$state" =~ ^(up|DOWN)$ ]] || { state="unreachable"; bytes=""; }
+
+    local rate="-"
+    local prev="$STATE_DIR/cache_prev/$id"
+    if [[ -n "$bytes" && -f "$prev" ]]; then
+      rate=$(awk -v now="$now" -v bytes="$bytes" '
+        {
+          elapsed = now - $2
+          if (elapsed > 0 && bytes >= $1) {
+            speed = (bytes - $1) / elapsed / 1048576
+            printf "%.1f MB/s", speed
+          } else { printf "-" }
+        }' "$prev")
+    fi
+    [[ -n "$bytes" ]] && printf '%s %s\n' "$bytes" "$now" > "$prev"
+
+    printf '%-5s %-16s %-6s %-11s %-9s %s\n' "$id" "${IPS[$i]}" "${PORTS[$i]}" \
+      "$state" "$(human_bytes "${bytes:-}")" "$rate"
+  done
+}
+
+human_bytes() {
+  [[ -n "${1:-}" ]] || { echo "?"; return; }
+  awk -v b="$1" 'BEGIN {
+    split("B KB MB GB TB", unit, " ")
+    i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf "%.1f%s", b, unit[i]
+  }'
+}
+
 cmd_status() {
   local peer; peer=$(cat "$PEER_FILE" 2>/dev/null || true)
   [[ -n "$peer" ]] || { echo "No bootstrap address recorded; run 'start' first." >&2; exit 1; }
-
-  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT PROCESS
-  local i state
-  for i in "${!IDS[@]}"; do
-    state=$(remote "${IPS[$i]}" "
-      if [ -f '$REMOTE_DIR/run/server.pid' ] && kill -0 \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null
-      then echo up; else echo DOWN; fi" 2>/dev/null || echo unreachable)
-    printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" "$state"
-  done
-
-  echo
+  local watch=0
+  [[ "${1:-}" == "--watch" ]] && watch=1
   local b; b=$(index_of "$BOOTSTRAP_NODE")
-  local extra=""
-  [[ "${1:-}" == "--watch" ]] && extra="--watch --timeout $READY_TIMEOUT --interval 15"
-  remote "${IPS[$b]}" "cd '$REMOTE_DIR/repo' && \"\$HOME/$REMOTE_DIR/venv/bin/python\" \
-    examples/check_qwen_swarm.py --initial-peers '$peer' --model '$MODEL_NAME' $extra"
+  local deadline=$(( $(date +%s) + READY_TIMEOUT ))
+
+  # Both halves are polled together: the DHT says which layers are claimed, the hosts say
+  # whether the weights behind those claims are still arriving. Watching only one of them
+  # is what makes a slow download look like a hung cluster.
+  while true; do
+    status_hosts
+    echo
+    local rc=0
+    remote "${IPS[$b]}" "cd '$REMOTE_DIR/repo' && \"\$HOME/$REMOTE_DIR/venv/bin/python\" \
+      examples/check_qwen_swarm.py --initial-peers '$peer' --model '$MODEL_NAME'" || rc=$?
+    (( watch )) || return "$rc"
+    (( rc == 0 )) && return 0
+    if (( $(date +%s) >= deadline )); then
+      echo "Gave up after ${READY_TIMEOUT}s. Raise READY_TIMEOUT, or run 'diag'." >&2
+      return 1
+    fi
+    sleep 15
+    echo
+  done
 }
 
 # One line per host answering "is it alive, is it downloading, what broke".
