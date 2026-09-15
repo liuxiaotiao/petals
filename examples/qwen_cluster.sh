@@ -19,6 +19,7 @@
 #   examples/qwen_cluster.sh cleanup --stale --yes  # kill only servers from an earlier
 #                                     # generation that survived a restart and still hold the port
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
+#   examples/qwen_cluster.sh service install  # systemd --user units: restart on crash and at boot
 #   examples/qwen_cluster.sh stop      # stop the servers in HOSTS_FILE; leaves the DHT up
 #   examples/qwen_cluster.sh stop --dht  # also stop the bootstrap DHT (takes the whole swarm down)
 #
@@ -935,12 +936,19 @@ proxy_addr() {
 # them because they already have their own egress and need not add load to that uplink.
 # HTTP_PROXY is deliberately left unset: the proxy speaks CONNECT only, so pointing plain
 # HTTP at it would turn a working request into a 405.
-proxy_env_for() {
+proxy_applies_to() {
   local id="$1" addr skip
-  addr=$(proxy_addr) || return 0
-  [[ -n "$addr" ]] || return 0
-  [[ "$id" == "$PROXY_NODE" ]] && return 0
-  for skip in $PROXY_SKIP; do [[ "$id" == "$skip" ]] && return 0; done
+  addr=$(proxy_addr)
+  [[ -n "$addr" ]] || return 1
+  [[ "$id" == "$PROXY_NODE" ]] && return 1
+  for skip in $PROXY_SKIP; do [[ "$id" == "$skip" ]] && return 1; done
+  return 0
+}
+
+proxy_env_for() {
+  local id="$1" addr
+  proxy_applies_to "$id" || return 0
+  addr=$(proxy_addr)
   local direct; direct="localhost,127.0.0.1,$(IFS=,; echo "${IPS[*]}")"
   printf "HTTPS_PROXY='%s' https_proxy='%s' NO_PROXY='%s' no_proxy='%s' " \
     "$addr" "$addr" "$direct" "$direct"
@@ -1082,6 +1090,230 @@ $(proxy_env_for "$node")\
 "
 }
 
+# Keep the swarm up across reboots and crashes.
+#
+# systemd --user units keep this out of system-wide configuration, at the cost of needing
+# lingering: without it a user's units stop when the last session ends and never start at
+# boot. Enabling lingering is the one step that may need privileges, and 'service install'
+# says plainly whether it got them rather than leaving a cluster that quietly never comes
+# back after a reboot.
+SERVICE_NAME="petals-qwen"
+# Prepended to every remote block that runs systemctl --user.
+SYSTEMD_ENV='export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"'
+DHT_SERVICE_NAME="petals-qwen-dht"
+
+# The environment the unit starts the server with. Same knobs cmd_start passes, written to
+# a file instead of a command line so systemd can re-read them on every restart.
+service_env() {  # service_env <index> <peer>
+  local i="$1" peer="$2" name
+  printf 'BOOTSTRAP_PEER=%s\n' "$peer"
+  printf 'ANNOUNCE_IP=%s\n' "${IPS[$i]}"
+  printf 'PORT=%s\n' "${PORTS[$i]}"
+  printf 'MODEL_NAME=%s\n' "$MODEL_NAME"
+  printf 'MAX_DISK_SPACE=%s\n' "$MAX_DISK_SPACE"
+  # The host's own blocks= wins over a NUM_BLOCKS inherited from this shell.
+  if [[ -n "${NBLOCKS[$i]}" ]]; then printf 'NUM_BLOCKS=%s\n' "${NBLOCKS[$i]}"; fi
+  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY DHT_PREFIX MODEL_REVISION \
+              HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN; do
+    [[ "$name" == NUM_BLOCKS && -n "${NBLOCKS[$i]}" ]] && continue
+    [[ -n "${!name:-}" ]] && printf '%s=%s\n' "$name" "${!name}"
+  done
+  if proxy_applies_to "${IDS[$i]}"; then
+    local addr; addr=$(proxy_addr)
+    local direct; direct="localhost,127.0.0.1,$(IFS=,; echo "${IPS[*]}")"
+    printf 'HTTPS_PROXY=%s\nhttps_proxy=%s\nNO_PROXY=%s\nno_proxy=%s\n' \
+      "$addr" "$addr" "$direct" "$direct"
+  fi
+}
+
+cmd_service() {
+  local action="${1:-status}"; shift || true
+
+  case "$action" in
+    install)
+      local peer
+      peer=$(read_bootstrap_peer) || {
+        echo "No bootstrap address; run 'start' once before installing units." >&2; exit 1
+      }
+      local bnode_idx=""; bnode_idx=$(find_index "$BOOTSTRAP_NODE") || true
+
+      local i
+      for i in "${!IDS[@]}"; do
+        local id="${IDS[$i]}"
+        printf '%-5s ' "$id"
+        # The unit text is built here, fully substituted, so nothing extra has to be
+        # deployed and there is one place to read when the behaviour is in question.
+        remote "${IPS[$i]}" "
+mkdir -p ~/.config/systemd/user '$REMOTE_DIR/run' '$REMOTE_DIR/logs'
+cat > '$REMOTE_DIR/run/server.env' <<'ENVEOF'
+$(service_env "$i" "$peer")
+ENVEOF
+echo \"CACHE_DIR=\$HOME/$REMOTE_DIR/cache\" >> '$REMOTE_DIR/run/server.env'
+echo \"PYTHON=\$HOME/$REMOTE_DIR/venv/bin/python\" >> '$REMOTE_DIR/run/server.env'
+
+cat > ~/.config/systemd/user/$SERVICE_NAME.service <<UNITEOF
+[Unit]
+Description=Petals server for $MODEL_NAME
+After=network-online.target
+Wants=network-online.target
+# A crash loop must not hammer the Hub or the GPU; give up for a while instead.
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/$REMOTE_DIR/repo
+EnvironmentFile=%h/$REMOTE_DIR/run/server.env
+ExecStart=/bin/bash examples/run_qwen_server.sh
+# Keep the pidfile the other subcommands read, so status/diag/cleanup still work.
+ExecStartPost=/bin/sh -c 'echo \\\${MAINPID} > %h/$REMOTE_DIR/run/server.pid'
+ExecStopPost=/bin/sh -c 'rm -f %h/$REMOTE_DIR/run/server.pid'
+Restart=always
+RestartSec=20
+KillMode=mixed
+KillSignal=SIGTERM
+# Petals unregisters its blocks and releases the port on shutdown. Cutting that short is
+# what leaves a second p2pd bound to the same port and clients failing on peer id mismatch.
+TimeoutStopSec=180
+StandardOutput=append:%h/$REMOTE_DIR/logs/server.log
+StandardError=append:%h/$REMOTE_DIR/logs/server.log
+
+[Install]
+WantedBy=default.target
+UNITEOF
+# Lingering first: it talks to the system bus, and it is what creates the runtime
+# directory the user bus lives in. Doing it second fails on a host with no prior session.
+linger=NOT-ENABLED
+if loginctl show-user \"\$(id -un)\" 2>/dev/null | grep -q 'Linger=yes'; then linger=already-on
+elif loginctl enable-linger \"\$(id -un)\" 2>/dev/null; then linger=enabled
+elif sudo -n loginctl enable-linger \"\$(id -un)\" 2>/dev/null; then linger='enabled(sudo)'
+fi
+$SYSTEMD_ENV
+if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable $SERVICE_NAME.service >/dev/null 2>&1; then
+  echo \"unit enabled; linger=\$linger\"
+else
+  echo \"unit written but systemctl --user is unreachable; linger=\$linger\"
+fi
+" || echo "FAILED"
+      done
+
+      if [[ -n "$bnode_idx" ]]; then
+        echo
+        printf 'DHT on %-5s ' "$BOOTSTRAP_NODE"
+        remote "${IPS[$bnode_idx]}" "
+set -e
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/$DHT_SERVICE_NAME.service <<UNITEOF
+[Unit]
+Description=Petals bootstrap DHT for $MODEL_NAME
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/$REMOTE_DIR
+ExecStart=%h/$REMOTE_DIR/venv/bin/python -m petals.cli.run_dht \\
+  --host_maddrs /ip4/0.0.0.0/tcp/$DHT_PORT \\
+  --announce_maddrs /ip4/${IPS[$bnode_idx]}/tcp/$DHT_PORT \\
+  --identity_path %h/$REMOTE_DIR/qwen-dht.identity
+ExecStartPost=/bin/sh -c 'echo \\\${MAINPID} > %h/$REMOTE_DIR/run/dht.pid'
+ExecStopPost=/bin/sh -c 'rm -f %h/$REMOTE_DIR/run/dht.pid'
+Restart=always
+RestartSec=10
+StandardOutput=append:%h/$REMOTE_DIR/logs/dht.log
+StandardError=append:%h/$REMOTE_DIR/logs/dht.log
+
+[Install]
+WantedBy=default.target
+UNITEOF
+$SYSTEMD_ENV
+if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable $DHT_SERVICE_NAME.service >/dev/null 2>&1; then
+  echo 'unit enabled'
+else
+  echo 'unit written but systemctl --user is unreachable'
+fi
+" || echo "FAILED"
+        # The DHT must come up before the servers that dial it, on this host at least.
+        remote "${IPS[$bnode_idx]}" "
+$SYSTEMD_ENV
+mkdir -p ~/.config/systemd/user/$SERVICE_NAME.service.d
+printf '[Unit]\\nAfter=$DHT_SERVICE_NAME.service\\nWants=$DHT_SERVICE_NAME.service\\n' \
+  > ~/.config/systemd/user/$SERVICE_NAME.service.d/after-dht.conf
+systemctl --user daemon-reload
+" || true
+      fi
+
+      echo
+      echo "Installed but not started. The units take over from 'start'/'stop':"
+      echo "  examples/qwen_cluster.sh service start     # hand the running swarm to systemd"
+      echo "  examples/qwen_cluster.sh service status"
+      echo "Any host reporting LINGERING NOT ENABLED needs one command as root there:"
+      echo "  sudo loginctl enable-linger \$(id -un)"
+      ;;
+
+    start|stop|restart)
+      # Stop first so a server started by 'start' does not end up alongside the unit's own:
+      # two managers for one port is the failure this cluster already paid for once.
+      echo "systemctl --user $action $SERVICE_NAME ..."
+      fanout "svc-$action" "
+$SYSTEMD_ENV
+if [ -f '$REMOTE_DIR/run/server.pid' ] && ! systemctl --user is-active --quiet $SERVICE_NAME 2>/dev/null; then
+  kill \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null || true
+  sleep 5
+fi
+systemctl --user $action $SERVICE_NAME.service 2>&1 | tail -2
+systemctl --user is-active $SERVICE_NAME.service 2>/dev/null || true
+" || true
+      local id
+      for id in "${IDS[@]}"; do
+        printf '  %-5s %s\n' "$id" "$(tail -1 "$STATE_DIR/out/$id.svc-$action" 2>/dev/null || echo no-response)"
+      done
+      ;;
+
+    status)
+      fanout svc-status "
+$SYSTEMD_ENV
+active=\$(systemctl --user is-active $SERVICE_NAME.service 2>/dev/null || echo none)
+enabled=\$(systemctl --user is-enabled $SERVICE_NAME.service 2>/dev/null || echo none)
+linger=no
+loginctl show-user \"\$(id -un)\" 2>/dev/null | grep -q 'Linger=yes' && linger=yes
+restarts=\$(systemctl --user show $SERVICE_NAME.service -p NRestarts --value 2>/dev/null || echo ?)
+echo \"\$active enabled=\$enabled linger=\$linger restarts=\${restarts:-0}\"
+" || true
+      printf '%-5s %-10s %s\n' NODE ACTIVE DETAIL
+      local id
+      for id in "${IDS[@]}"; do
+        local line; line=$(tail -1 "$STATE_DIR/out/$id.svc-status" 2>/dev/null || echo "no-response")
+        printf '%-5s %-10s %s\n' "$id" "${line%% *}" "${line#* }"
+      done
+      echo
+      echo "linger=no means that host will NOT bring its server back after a reboot."
+      ;;
+
+    uninstall)
+      fanout svc-uninstall "
+$SYSTEMD_ENV
+systemctl --user disable --now $SERVICE_NAME.service >/dev/null 2>&1 || true
+systemctl --user disable --now $DHT_SERVICE_NAME.service >/dev/null 2>&1 || true
+rm -rf ~/.config/systemd/user/$SERVICE_NAME.service ~/.config/systemd/user/$SERVICE_NAME.service.d \
+       ~/.config/systemd/user/$DHT_SERVICE_NAME.service
+systemctl --user daemon-reload
+echo removed
+" || true
+      echo "Units removed. Lingering is left enabled; disable it yourself if you want it off."
+      ;;
+
+    logs)
+      local node="${1:-$BOOTSTRAP_NODE}" i; i=$(index_of "$node")
+      remote "${IPS[$i]}" "$SYSTEMD_ENV
+journalctl --user -u $SERVICE_NAME.service -n ${2:-40} --no-pager" || true
+      ;;
+
+    *) echo "usage: qwen_cluster.sh service {install|start|stop|restart|status|logs|uninstall}" >&2; return 2 ;;
+  esac
+}
+
 cmd_stop() {
   local with_dht=0
   [[ "${1:-}" == --dht || "${1:-}" == --all ]] && with_dht=1
@@ -1124,6 +1356,7 @@ case "${1:-}" in
   logs)   shift; cmd_logs "$@" ;;
   proxy)  shift; cmd_proxy "$@" ;;
   client) shift; cmd_client "$@" ;;
+  service) shift; cmd_service "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \

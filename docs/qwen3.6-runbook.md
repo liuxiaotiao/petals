@@ -135,6 +135,46 @@ bash examples/qwen_cluster.sh client \
 
 ---
 
+## 3.5 开机自启与崩溃自愈
+
+`start` 起的服务端是裸进程:机器重启就没了,进程崩了也不会回来。要长期跑,装 systemd
+用户单元:
+
+```bash
+bash examples/qwen_cluster.sh service install   # 写单元、开 lingering,不启动
+bash examples/qwen_cluster.sh service start     # 把运行中的 swarm 交给 systemd 接管
+bash examples/qwen_cluster.sh service status
+```
+
+装完之后**用 `service start/stop/restart`,不要再用 `start`/`stop`**。两个管理者抢同一个
+端口,正是这套集群已经付过一次学费的故障(见下面 `peer id mismatch` 那节)。`service start`
+会先把裸进程停掉再交给 systemd,避免重演。
+
+单元里几个值得知道的设定:
+
+- `Restart=always` + `RestartSec=20`,崩了自动拉起。
+- `StartLimitIntervalSec=900` / `StartLimitBurst=5`:15 分钟内崩 5 次就停手,不然一个
+  起不来的服务端会不停地捶 Hub 和显卡。
+- `TimeoutStopSec=180`:Petals 关停要注销层、释放显存和端口。给得太短正是两代进程
+  共用一个端口的成因。
+- `ExecStartPost` 仍然写 `run/server.pid`,所以 `status`、`diag`、`cleanup --stale`
+  照常可用。
+- 环境从 `run/server.env` 读,里面有每台自己的 `NUM_BLOCKS`、`ANNOUNCE_IP`,以及
+  **按主机决定的 `HTTPS_PROXY`**——代理节点自己那台不会被写入代理变量。
+
+**`linger=NOT-ENABLED` 必须处理。** 没有 lingering,用户单元在 SSH 会话结束时就停,
+开机也不会起,等于白装。`service install` 会尝试自动开(先试无 sudo,再试 `sudo -n`),
+开不了就明说。那种情况去那台机器上跑一次:
+
+```bash
+sudo loginctl enable-linger $(id -un)
+```
+
+改了 `task/hosts.txt` 的层数、换了 `HF_ENDPOINT`、或者代理地址变了,重跑
+`service install` 刷新 env 文件,再 `service restart`。
+
+`service logs <节点>` 看 journal,`service uninstall` 卸掉单元(lingering 保留)。
+
 ## 4. 子命令速查
 
 | 命令 | 作用 |
@@ -151,6 +191,7 @@ bash examples/qwen_cluster.sh client \
 | `cleanup [--ours\|--gpu\|--stale] [--yes]` | 列出/清理残留进程。默认只列不杀。`--stale` 只杀**上一代**服务端,保留当前那个 |
 | `synctime [--yes]` | 看时钟偏差。全部 NTP 同步时会拒绝 `--yes` |
 | `hosts` | 打印解析出来的节点表 |
+| `service {install\|start\|stop\|restart\|status\|logs\|uninstall}` | systemd 用户单元:崩溃自愈 + 开机自启。装了之后用它代替 `start`/`stop` |
 | `stop [--dht]` | 停 `HOSTS_FILE` 里那些服务端。**默认不碰 bootstrap DHT**——停它等于停掉整个 swarm,包括当前 hosts 文件里没列的那些。`--dht` 才一并停 |
 
 ---
