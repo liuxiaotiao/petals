@@ -242,10 +242,31 @@ import urllib.error
 import urllib.request
 
 
+class _Redirects(urllib.request.HTTPRedirectHandler):
+    """Follow 308 as well, which urllib only learned to do in Python 3.11.
+
+    Mirrors lean on 308 heavily. On 3.10 an unfollowed one surfaces as an HTTPError that
+    is indistinguishable from a missing repo, so a working mirror reads as a broken one.
+    """
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        # Aliasing it to http_error_301 is not enough: redirect_request() checks the code
+        # against a hardcoded list that predates 308 and raises on anything outside it.
+        # 308 is 307 with permanence, and permanence is irrelevant to a one-shot probe.
+        return self.http_error_307(req, fp, 307, msg, headers)
+
+
+OPENER = urllib.request.build_opener(_Redirects)
+
+
+def open_url(url, headers=None, timeout=20):
+    return OPENER.open(urllib.request.Request(url, headers=headers or {}), timeout=timeout)
+
+
 def probe(url):
     """An HTTP error still proves we reached the host; only a transport failure does not."""
     try:
-        urllib.request.urlopen(url, timeout=15)
+        open_url(url, timeout=15)
         return "ok"
     except urllib.error.HTTPError:
         return "ok"
@@ -266,8 +287,7 @@ def probe_weights(endpoint, model):
     revision = os.environ.get("QWEN_REVISION") or "main"
     base = "%s/%s/resolve/%s" % (endpoint, model, revision)
     try:
-        request = urllib.request.Request(base + "/model.safetensors.index.json")
-        index = json.loads(urllib.request.urlopen(request, timeout=20).read().decode())
+        index = json.loads(open_url(base + "/model.safetensors.index.json").read().decode())
         shard = sorted(set(index["weight_map"].values()))[0]
     except urllib.error.HTTPError as error:
         # An HTTP status means a server answered: the repo is missing, gated or misnamed.
@@ -278,8 +298,8 @@ def probe_weights(endpoint, model):
         # Anything else never reached one, which is a network problem, not a repo problem.
         return "UNREACHABLE"
     try:
-        request = urllib.request.Request(base + "/" + shard, headers={"Range": "bytes=0-0"})
-        return "ok" if urllib.request.urlopen(request, timeout=30).read(1) else "EMPTY"
+        response = open_url(base + "/" + shard, headers={"Range": "bytes=0-0"}, timeout=30)
+        return "ok" if response.read(1) else "EMPTY"
     except Exception:
         return "UNREACHABLE"
 
@@ -306,7 +326,7 @@ if os.environ.get("QWEN_SKIP_XET") or endpoint != "https://huggingface.co":
 else:
     xet = probe("https://cas-server.xethub.hf.co")
 print("hub=%s cdn=%s xet=%s vram_free=%s%s" % (
-    probe(endpoint + "/api/models"),
+    probe("%s/api/models/%s" % (endpoint, model)),
     probe_weights(endpoint, model),
     xet,
     free,
