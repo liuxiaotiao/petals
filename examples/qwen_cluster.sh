@@ -25,7 +25,10 @@ REMOTE_DIR="${REMOTE_DIR:-petals-qwen}"          # relative to the remote user's
 BOOTSTRAP_NODE="${BOOTSTRAP_NODE:-N01}"
 DHT_PORT="${DHT_PORT:-31337}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
-MAX_DISK_SPACE="${MAX_DISK_SPACE:-40GB}"
+# Hub cache ceiling per host. A contiguous 11-layer range needs at most 25.5 GB of shard
+# files (14 layers would need up to 30.5 GB), so 30GB leaves room without letting rebalancing
+# grow the cache without bound. Petals evicts least-recently-used shards to stay under it.
+MAX_DISK_SPACE="${MAX_DISK_SPACE:-30GB}"
 # NODE_PY: an interpreter that already exists on every host (e.g. a conda env with torch).
 # The venv is then built on top of it with --system-site-packages, so torch is inherited
 # and Petals' own pins (transformers==4.43.1, numpy<2, peft, bitsandbytes) land in the venv
@@ -85,6 +88,57 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
 cmd_preflight() {
   local interp="${NODE_PY:-$PY}"
   echo "Checking ${#IDS[@]} hosts against interpreter: $interp"
+
+  # Sent base64 so the quoting survives two levels of shell.
+  local probe_b64
+  probe_b64=$(base64 <<'PROBE' | tr -d '\n'
+import urllib.error
+import urllib.request
+
+
+def probe(url):
+    """An HTTP error still proves we reached the host; only a transport failure does not."""
+    try:
+        urllib.request.urlopen(url, timeout=15)
+        return "ok"
+    except urllib.error.HTTPError:
+        return "ok"
+    except Exception:
+        return "UNREACHABLE"
+
+
+free = "n/a"
+try:
+    import torch
+
+    if torch.cuda.is_available():
+        free = "%.1fG" % (torch.cuda.mem_get_info(0)[0] / 1024**3)
+except Exception:
+    pass
+# huggingface.co serves the index; Xet-backed repos serve the actual bytes from xethub.
+print("hub=%s xet=%s vram_free=%s" % (
+    probe("https://huggingface.co/api/models"),
+    probe("https://cas-server.xethub.hf.co"),
+    free,
+))
+PROBE
+)
+
+  # Clock skew, measured one host at a time so SSH latency does not pollute it.
+  # hivemind rejects peers more than MAX_DHT_TIME_DISCREPANCY_SECONDS (3s) apart.
+  local i skews=()
+  for i in "${!IDS[@]}"; do
+    local t0 t1 remote_epoch
+    t0=$(date +%s)
+    remote_epoch=$(remote "${IPS[$i]}" "date +%s" 2>/dev/null || echo "")
+    t1=$(date +%s)
+    if [[ -z "$remote_epoch" ]]; then
+      skews+=("?")
+    else
+      skews+=("$(( remote_epoch - (t0 + t1) / 2 ))")
+    fi
+  done
+
   fanout preflight "
 py=\$('$interp' -c 'import sys; print(\"%d.%d.%d\" % sys.version_info[:3])' 2>/dev/null) || py=MISSING
 if [ \"\$py\" = MISSING ]; then
@@ -106,21 +160,29 @@ fi
 timeout 25 '$interp' -m pip download --no-deps -d /tmp/.qwen-pipcheck packaging >/dev/null 2>&1 \
   && pypi=ok || pypi=UNREACHABLE
 rm -rf /tmp/.qwen-pipcheck
+net=\$(echo '$probe_b64' | base64 -d > /tmp/.qwen_probe.py && timeout 45 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
+rm -f /tmp/.qwen_probe.py
 disk=\$(df -Pk \"\$HOME\" | awk 'NR==2 {printf \"%.0fG\", \$4/1048576}')
-echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi free=\$disk\"
-case \"\$torch\$venv\$git\$rsync\$github\$pypi\" in *MISSING*|*UNREACHABLE*) exit 1 ;; esac
+echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi \${net:-hub=? xet=? vram_free=?} disk_free=\$disk\"
+case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*) exit 1 ;; esac
 " || true
 
   echo
-  local id bad=0
-  for id in "${IDS[@]}"; do
-    local line; line=$(tail -1 "$STATE_DIR/out/$id.preflight" 2>/dev/null)
-    printf '  %s\n' "${line:-$id no-response}"
-    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" ]] && bad=$((bad + 1))
+  local bad=0
+  for i in "${!IDS[@]}"; do
+    local line skew mark
+    line=$(tail -1 "$STATE_DIR/out/${IDS[$i]}.preflight" 2>/dev/null)
+    skew="${skews[$i]}"
+    # hivemind's own limit is 3s; flag at 2s so there is margin.
+    if [[ "$skew" == "?" ]] || (( ${skew#-} >= 2 )); then mark="CLOCK-SKEW"; else mark="ok"; fi
+    printf '  %s clock=%ss/%s\n' "${line:-${IDS[$i]} no-response}" "$skew" "$mark"
+    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" != ok ]] && bad=$((bad + 1))
   done
   echo
   if (( bad )); then
     echo "$bad host(s) are not ready. Fix those before running deploy." >&2
+    echo "  CLOCK-SKEW  -> hivemind drops peers >3s apart; sync NTP (chrony / systemd-timesyncd)" >&2
+    echo "  xet=UNREACHABLE -> set HF_HUB_DISABLE_XET=1, or allow *.xethub.hf.co through egress" >&2
     return 1
   fi
   echo "All hosts are ready for deploy."
@@ -206,7 +268,8 @@ echo \$! > run/dht.pid
   # Pass through only the knobs that are set, so run_qwen_server.sh keeps its own defaults.
   local passthrough=""
   local name
-  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY DHT_PREFIX MODEL_REVISION; do
+  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY DHT_PREFIX MODEL_REVISION \
+              HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     [[ -n "${!name:-}" ]] && passthrough+="$name='${!name}' "
   done
 

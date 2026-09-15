@@ -65,6 +65,24 @@
 
 建议的递进验证顺序，每一步失败都不要往下走：
 
+### 每台要留多少磁盘
+
+服务器整片下载 safetensors，所以成本取决于层范围覆盖到几个分片。按真实的 26 分片索引，
+连续区间的最坏情况（十进制 GB）：
+
+| 每台层数 | 最少 | 最多 | 30GB 上限 |
+| --- | --- | --- | --- |
+| 14（自动分层会选到这个） | 23.56 | **30.53** | 不够 |
+| 12 | 20.19 | 26.25 | 够 |
+| 11（建议值） | 18.51 | **25.48** | 够，余约 4.5 GB |
+| 6（T4） | 10.09 | 15.37 | 够 |
+
+`--max_disk_space 30GB` 按十进制解析，等于 27.94 GiB。超过上限时 `free_disk_space_for()`
+按最久未访问顺序淘汰旧分片；真腾不出来会明确报 `Insufficient disk space to load a block`，
+不会静默失败。再平衡把某台挪到别的层区间时会下新分片、淘汰旧的，缓存稳定在上限附近，不会无限增长。
+
+## 验证路线
+
 1. **不需要 GPU、不需要真权重**，先把链路跑通：
    `PETALS_TEST_LOCAL_SWARM=1 python -m pytest -o pythonpath=src tests/test_qwen_swarm.py -q`
    覆盖 DHT、跨节点 RPC、会话续写，以及 `--inference_only` 确实拒绝了反向。
@@ -104,7 +122,8 @@ Hivemind 的旧构建脚本使用 `pkg_resources`，因此这里固定 `setuptoo
 ```bash
 export SSH_USER=ubuntu                 # 各节点的登录用户，需已配好免密公钥
 export MODEL_NAME=Qwen/Qwen3.6-35B-A3B
-export MAX_DISK_SPACE=40GB             # 每台的 Hub 分片缓存上限，见下文磁盘一节
+export MAX_DISK_SPACE=30GB             # 每台的 Hub 分片缓存上限，见下文磁盘一节
+export NUM_BLOCKS=11                   # 24GB 卡；不设会自动选到 14 层并 OOM
 # 各节点已有的解释器（conda 环境等）。设了它就不再另装 torch。
 export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python
 
