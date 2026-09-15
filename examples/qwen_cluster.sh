@@ -236,6 +236,7 @@ cmd_preflight() {
   # Sent base64 so the quoting survives two levels of shell.
   local probe_b64
   probe_b64=$(base64 <<'PROBE' | tr -d '\n'
+import json
 import os
 import urllib.error
 import urllib.request
@@ -252,6 +253,34 @@ def probe(url):
         return "UNREACHABLE"
 
 
+def probe_weights(endpoint, model):
+    """Pull one real byte of one real shard, end to end, through this endpoint.
+
+    Metadata and file content travel different paths: the API host answers with a redirect
+    and the bytes come from a CDN on another domain, and a mirror can do the same. An
+    allowlist that knows only the API host therefore lets a name-based check pass while the
+    servers retry forever on an empty cache. Fetching actual weight bytes is the only probe
+    that distinguishes the two, and it follows whatever endpoint is really in effect instead
+    of a hardcoded CDN hostname that a mirror would never use.
+    """
+    base = "%s/%s/resolve/main" % (endpoint, model)
+    try:
+        request = urllib.request.Request(base + "/model.safetensors.index.json")
+        index = json.loads(urllib.request.urlopen(request, timeout=20).read().decode())
+        shard = sorted(set(index["weight_map"].values()))[0]
+    except urllib.error.HTTPError:
+        # An HTTP status means a server answered: the repo is missing, gated or misnamed.
+        return "NO-INDEX"
+    except Exception:
+        # Anything else never reached one, which is a network problem, not a repo problem.
+        return "UNREACHABLE"
+    try:
+        request = urllib.request.Request(base + "/" + shard, headers={"Range": "bytes=0-0"})
+        return "ok" if urllib.request.urlopen(request, timeout=30).read(1) else "EMPTY"
+    except Exception:
+        return "UNREACHABLE"
+
+
 free = "n/a"
 try:
     import torch
@@ -263,18 +292,23 @@ try:
         free = "%.1fG" % (torch.cuda.mem_get_info(0)[0] / 1024**3)
 except Exception as exc:
     free = "ERR-%s" % type(exc).__name__
-# huggingface.co serves the index; Xet-backed repos serve the actual bytes from xethub.
-# With HF_HUB_DISABLE_XET set, downloads fall back to the regular CDN and xethub is
-# irrelevant, so probing it would only produce a blocker that is already handled.
-xet = "disabled" if os.environ.get("QWEN_SKIP_XET") else probe("https://cas-server.xethub.hf.co")
-# huggingface.co only serves metadata. With Xet off the bytes come from a CDN host on a
-# different domain, which an allowlist that only knows huggingface.co will not permit --
-# the servers then sit in a retry loop with an empty cache instead of failing.
-cdn = probe("https://us.aws.cdn.hf.co")
-if cdn != "ok":
-    cdn = probe("https://cdn-lfs.huggingface.co")
-print("hub=%s cdn=%s xet=%s vram_free=%s" % (
-    probe("https://huggingface.co/api/models"), cdn, xet, free))
+endpoint = os.environ.get("HF_ENDPOINT") or "https://huggingface.co"
+endpoint = endpoint.rstrip("/")
+model = os.environ.get("QWEN_MODEL") or "Qwen/Qwen3.6-35B-A3B"
+# Xet-backed repos serve their bytes from xethub rather than the CDN. With
+# HF_HUB_DISABLE_XET set, or through a mirror, that path is never taken, so probing it
+# would only report a blocker that is already handled.
+if os.environ.get("QWEN_SKIP_XET") or endpoint != "https://huggingface.co":
+    xet = "disabled"
+else:
+    xet = probe("https://cas-server.xethub.hf.co")
+print("hub=%s cdn=%s xet=%s vram_free=%s%s" % (
+    probe(endpoint + "/api/models"),
+    probe_weights(endpoint, model),
+    xet,
+    free,
+    "" if endpoint == "https://huggingface.co" else " via=%s" % endpoint.split("//")[-1],
+))
 PROBE
 )
 
@@ -303,7 +337,7 @@ timeout 25 '$interp' -m pip download --no-deps -d /tmp/.qwen-pipcheck packaging 
   && pypi=ok || pypi=UNREACHABLE
 rm -rf /tmp/.qwen-pipcheck
 net=\$(echo '$probe_b64' | base64 -d > /tmp/.qwen_probe.py && \
-  QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' timeout 45 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
+  QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' HF_ENDPOINT='${HF_ENDPOINT:-}' QWEN_MODEL='$MODEL_NAME' timeout 75 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
 rm -f /tmp/.qwen_probe.py
 disk=\$(df -Pk \"\$HOME\" | awk 'NR==2 {printf \"%.0fG\", \$4/1048576}')
 echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi \${net:-hub=? xet=? vram_free=?} disk_free=\$disk\"
@@ -342,9 +376,11 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     echo "                 (rtt) means the offset was timed over SSH and is only good to a" >&2
     echo "                 second or two; (ntp) means the host's own daemon reported it." >&2
     echo "  xet=UNREACHABLE -> export HF_HUB_DISABLE_XET=1 and re-run; that makes this check pass" >&2
-    echo "  cdn=UNREACHABLE -> weights cannot be downloaded at all: allow *.cdn.hf.co and" >&2
-    echo "                     cdn-lfs*.huggingface.co, set HF_ENDPOINT to a mirror, or" >&2
-    echo "                     pre-seed the cache from a host whose egress works" >&2
+    echo "  cdn=UNREACHABLE -> the API answered but real weight bytes did not arrive: allow" >&2
+    echo "                     *.cdn.hf.co and cdn-lfs*.huggingface.co, set HF_ENDPOINT to a" >&2
+    echo "                     mirror, or pre-seed the cache from a host whose egress works" >&2
+    echo "  cdn=NO-INDEX    -> the repo index itself would not load: wrong MODEL_NAME, a gated" >&2
+    echo "                     repo needing HF_TOKEN, or a mirror that does not carry it" >&2
     echo "  vram_free=ERR-* -> CUDA context could not be created; the GPU is full or wedged" >&2
     echo "  (clock-marginal is a warning only and does not block deploy)" >&2
     return 1
