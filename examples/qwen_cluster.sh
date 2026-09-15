@@ -8,6 +8,8 @@
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
 #   examples/qwen_cluster.sh proxy start  # lend PROXY_NODE's egress to hosts that have none
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
+#   examples/qwen_cluster.sh start --restart  # also restart servers already running,
+#                                     # the only way to change a running server's environment
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
 #   examples/qwen_cluster.sh diag      # why is nothing online: alive? downloading? crashed?
 #   examples/qwen_cluster.sh cleanup   # list stale/GPU-holding processes (kills nothing)
@@ -503,6 +505,8 @@ venv/bin/python -c 'import petals, torch; print(\"{ID}\", petals.__version__, to
 
 cmd_start() {
   mkdir -p "$STATE_DIR/out"
+  local restart=0
+  [[ "${1:-}" == --restart ]] && restart=1
 
   # Freeing the GPUs comes first: it is independent of the DHT, and a server that
   # starts onto an occupied card just OOMs. Kills only foreign GPU holders; our own
@@ -563,10 +567,32 @@ done
 echo '{ID} cleared'
 " || true
 
+  # Say out loud which hosts get the proxy. Its absence is otherwise invisible until a
+  # server has spent hours retrying against an endpoint it cannot reach.
+  local addr; addr=$(proxy_addr)
+  if [[ -n "$addr" ]]; then
+    local routed=() i
+    for i in "${!IDS[@]}"; do
+      [[ -n "$(proxy_env_for "${IDS[$i]}")" ]] && routed+=("${IDS[$i]}")
+    done
+    echo "Hub access: ${#routed[@]} host(s) via $addr; the rest use their own egress."
+  else
+    echo "Hub access: no proxy registered, every host will use its own egress."
+    echo "  If some hosts have none, run 'proxy start' first or they will retry forever." >&2
+  fi
+
+  local restart_step=""
+  if (( restart )); then
+    echo "--restart: stopping running servers first so they pick up this environment."
+    restart_step="
+if [ -f run/server.pid ]; then kill \$(cat run/server.pid) 2>/dev/null || true; rm -f run/server.pid; fi
+sleep 3"
+  fi
+
   echo "Starting ${#IDS[@]} servers ..."
   fanout start "
 set -e
-cd '$REMOTE_DIR'
+cd '$REMOTE_DIR'$restart_step
 if [ -f run/server.pid ] && kill -0 \$(cat run/server.pid) 2>/dev/null; then echo already-running; exit 0; fi
 cd repo
 BOOTSTRAP_PEER='$peer' ANNOUNCE_IP='{IP}' PORT='{PORT}' \

@@ -1,0 +1,238 @@
+# Qwen3.6-35B-A3B 私有 swarm 运行手册
+
+控制节点 `~/petals`,15 个 GPU 节点,SSH 走 22 端口,Petals 服务端口 9101。
+所有命令都在**控制节点**执行,不需要登到各个节点上去。
+
+本手册配套 `docs/qwen3.6-deployment.md`(讲原理和取舍),这里只讲怎么按顺序敲。
+
+---
+
+## 0. 这套集群的既定事实
+
+写在最前面,因为下面每一步的写法都由它决定:
+
+| 事实 | 后果 |
+|---|---|
+| 只有 **N06 / N07 / N08** 能访问 HuggingFace 的内容 CDN,其余 12 台被防火墙静默丢包 | 必须先起代理,否则 12 台永远下不动 |
+| N08 磁盘 44G 且有出口 | 它当代理节点(`PROXY_NODE=N08`) |
+| N06 磁盘 26G、N07 磁盘 25G | 这两台层数被磁盘卡住,比别人少;但它们有出口,不用走代理 |
+| 15 台时钟都由 chrony 对齐公网 NTP | 不要跑 `synctime --yes`,会把好钟弄坏 |
+| 这些节点只有自己在用 | 允许 `cleanup --gpu --yes` 杀掉占卡的外来进程 |
+| `.qwen-cluster/` 是运行状态,不是代码 | 同步代码时**不要**覆盖它,否则代理注册和 bootstrap 地址都会丢 |
+
+---
+
+## 1. 控制节点环境变量
+
+把这段存成 `~/petals/env.sh`,每次开新终端 `source ~/petals/env.sh`:
+
+```bash
+cd ~/petals
+
+export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python  # 各节点已有的 conda 环境
+export HF_HUB_DISABLE_XET=1        # 走普通 CDN,不走 xethub
+export MAX_DISK_SPACE=30GB         # 每台 HF 缓存上限
+export PROXY_NODE=N08              # 借出口的那台
+export PROXY_SKIP="N06 N07"        # 这两台自己有出口,别绕道
+export CLEANUP_ON_START=gpu        # start 前先清掉占卡的外来进程
+```
+
+不设 `HF_ENDPOINT` 就走 `huggingface.co`。hf-mirror 也验证过可用,
+要换就 `export HF_ENDPOINT=https://hf-mirror.com`,两边都行。
+
+---
+
+## 2. 从零到可用:完整顺序
+
+```bash
+source ~/petals/env.sh
+
+# ---- 第 1 步:清场 ----
+bash examples/qwen_cluster.sh cleanup              # 只列不杀,先看看有什么
+bash examples/qwen_cluster.sh cleanup --ours --yes # 杀本部署的遗留
+bash examples/qwen_cluster.sh cleanup --gpu  --yes # 连占卡的外来进程一起清
+
+# ---- 第 2 步:体检(此时 12 台的 cdn= 会失败,正常)----
+bash examples/qwen_cluster.sh preflight
+
+# ---- 第 3 步:推代码、建 venv ----
+bash examples/qwen_cluster.sh deploy
+
+# ---- 第 4 步:起代理(必须在 deploy 之后,N08 上要有代理脚本)----
+bash examples/qwen_cluster.sh proxy start
+
+# ---- 第 5 步:再体检,这次应该 15/15 全绿 ----
+bash examples/qwen_cluster.sh preflight
+
+# ---- 第 6 步:按实测显存/磁盘定每台层数 ----
+bash examples/qwen_cluster.sh plan --cap 8          # 先看
+bash examples/qwen_cluster.sh plan --cap 8 --write  # 合理再写回 task/hosts.txt
+
+# ---- 第 7 步:起服务 ----
+bash examples/qwen_cluster.sh start
+
+# ---- 第 8 步:盯着下载 ----
+bash examples/qwen_cluster.sh status --watch
+```
+
+第 4 步和第 5 步的顺序不能换:代理脚本随 `deploy` 一起 rsync 过去,
+没 deploy 就没有 `repo/examples/qwen_http_proxy.py`,`proxy start` 会失败。
+
+`--cap 8` 的理由:不设上限的话 A30 会被算成 13 层,显存只剩不到 1 GiB
+余量——首轮 OOM 就是这么来的。8 层仍有约 2.9 倍冗余,且每台少下约 6.5 GB,
+在代理那条唯一的上行链路上总共少走约 78 GB。
+
+### 分批起(可选,但推荐)
+
+12 台的下载全挤 N08 一条上行。分两批能更快拿到一个可用的 swarm:
+
+```bash
+# 第一批:6 台 A30 × 8 层 = 48 个层位,够盖满 40 层
+awk '$1 ~ /^N(0[1-5]|08)$/ || /^#/' task/hosts.txt > task/hosts.wave1
+HOSTS_FILE=task/hosts.wave1 bash examples/qwen_cluster.sh start
+bash examples/qwen_cluster.sh status --watch
+#   等到 "Every layer is online"
+
+# 第二批:补上剩下 9 台。已在跑的会自动跳过(already-running)
+bash examples/qwen_cluster.sh start
+```
+
+分批只影响 `start`。**`proxy start` 始终用完整的 `task/hosts.txt` 跑**——
+代理的客户端白名单是从 `HOSTS_FILE` 生成的,拿分批文件去起代理,
+第二批那 9 台会被自己的代理拒之门外。
+
+---
+
+## 3. 客户端
+
+等 `status` 报 "Every layer is online" 之后:
+
+```bash
+BOOTSTRAP_PEER=$(cat .qwen-cluster/bootstrap_peer)
+
+python examples/qwen_generate.py \
+  --initial-peers "$BOOTSTRAP_PEER" \
+  --prompt '请解释一下分布式推理的工作原理。' \
+  --max-new-tokens 128
+```
+
+服务端如果固定了 `MODEL_REVISION`,客户端要加同样的 `--revision`。
+两边都不指定前缀时,会从仓库名推出同一个 DHT 前缀
+`Qwen3-6-35B-A3B-petals-qwen-v1`。
+
+这是 Petals 的 Python 调用,**不是 HTTP / OpenAI 接口**,本部署没有做 HTTP 网关。
+
+---
+
+## 4. 子命令速查
+
+| 命令 | 作用 |
+|---|---|
+| `preflight` | 只读体检:python/torch/GPU/venv/git/rsync/github/pypi/HF 可达性/显存/磁盘/时钟。不改任何东西 |
+| `plan [--cap N] [--write]` | 用 preflight 量到的真实空闲显存和磁盘算每台层数,写回 `task/hosts.txt`(留 `.bak`) |
+| `deploy` | rsync 本仓库到各节点 `~/petals-qwen/repo`,基于 `NODE_PY` 建 venv。幂等 |
+| `proxy start\|stop\|status\|logs` | 在 `PROXY_NODE` 上起 CONNECT 代理,并让其余节点经它访问 HF |
+| `start [--restart]` | 起 bootstrap DHT,再起所有 GPU 服务端。默认跳过已在跑的;`--restart` 先停后起,**改环境变量的唯一办法** |
+| `status [--watch]` | 每台的进程状态 + 缓存大小 + 下载速率,加上 DHT 里的层覆盖 |
+| `diag` | 没上线时用:进程死活、缓存大小、日志最后一条错误 + 该错误有多旧、bootstrap DHT 状态 |
+| `logs <节点> [行数]` | 看某一台的服务端日志 |
+| `cleanup [--ours\|--gpu] [--yes]` | 列出/清理残留进程。默认只列不杀 |
+| `synctime [--yes]` | 看时钟偏差。全部 NTP 同步时会拒绝 `--yes` |
+| `hosts` | 打印解析出来的节点表 |
+| `stop` | 停所有服务端,再停 DHT。bootstrap 身份保留,下次 `start` 地址不变 |
+
+---
+
+## 5. 故障对照
+
+### preflight 的 `cdn=` 失败
+
+`cdn=` 是真的去取一次模型索引、再对真实分片发 `Range: bytes=0-0`,
+拿到那一个字节才算 `ok`。只 ping 域名不算数——典型故障恰恰是 API 通、
+内容 CDN 被挡,那样服务端会抱着空缓存无限重试而不是干脆报错。
+
+| 取值 | 含义 | 处理 |
+|---|---|---|
+| `UNREACHABLE-TimeoutError` | 防火墙静默丢包 | 起代理,或让网络组放行 `*.cdn.hf.co`、`cdn-lfs*.huggingface.co` |
+| `UNREACHABLE-ConnectionRefusedError` | 端口被拒 | 同上 |
+| `UNREACHABLE-SSLCertVerificationError` | 有 TLS 中间人,解释器不信它的 CA | 给 Python 指系统 CA(**不要**关校验) |
+| `UNREACHABLE-gaierror` | DNS 解析不了 | 查这台的 resolver |
+| `NO-INDEX-404` | 该端点没收录这个仓库 | 换 `HF_ENDPOINT` |
+| `NO-INDEX-401/403` | 仓库是 gated | 接受条款并设 `HF_TOKEN` |
+
+### 服务端一直 JOINING,缓存停在 100KB 上下
+
+这不是慢,是卡死,而且原因几乎总是同一个:**那台的进程环境里没有 `HTTPS_PROXY`**。
+
+100KB 左右正好是 `config.json` 加 `model.safetensors.index.json` 的体积。元数据走
+`huggingface.co` 的 API(没被墙),一到 CDN 取真正的分片就超时重试,永远不会自己好。
+
+```bash
+# 决定性的一条:直接看进程环境
+ssh -n ubuntu@<该节点IP> \
+  "tr '\0' '\n' < /proc/\$(cat ~/petals-qwen/run/server.pid)/environ | grep -i proxy \
+   || echo '(没有任何 proxy 变量)'"
+```
+
+环境变量只在**进程启动时**注入,所以改不了正在跑的进程。而 `start` 默认跳过已在跑的
+服务端,只会打印 `already-running`——**重跑 `start` 修不好这个问题**。必须:
+
+```bash
+bash examples/qwen_cluster.sh proxy start              # 确保注册在
+bash examples/qwen_cluster.sh start --restart          # 先停后起
+```
+
+`start` 现在会在启动前打印一行 "Hub access: N host(s) via ...",没有代理时会明确警告。
+启动时扫一眼这行,比事后查十小时划算。
+
+### `status` 长时间停在 JOINING
+
+正常。35B 的权重挤一条上行,慢是预期。看 `RATE` 列:
+
+- 有数字 → 在下,等着
+- 某台一直 `0.0 MB/s` 而别人在动 → `logs <那台> 80`
+- 全部 `0.0 MB/s` → `proxy logs 40` 看代理是不是挂了
+
+### `status` 说 "No bootstrap address cached"
+
+`.qwen-cluster/bootstrap_peer` 丢了。新版会自动从 N01 的 `logs/dht.log` 捞回来;
+如果控制节点上还是旧脚本:
+
+```bash
+mkdir -p .qwen-cluster
+ssh -n ubuntu@192.168.1.2 \
+  "grep -ao '/ip4/192.168.1.2/tcp/31337/p2p/[A-Za-z0-9]*' ~/petals-qwen/logs/dht.log | head -1" \
+  > .qwen-cluster/bootstrap_peer
+```
+
+**同时一定要重跑 `proxy start`**。代理的注册信息也在 `.qwen-cluster/` 里,
+丢了之后 `start` 和 `preflight` 就不再给节点注入 `HTTPS_PROXY`,12 台会退回
+没有出口的状态。`proxy start` 见进程还活着会打印 `already-running` 直接返回,
+不会重启它,只把注册补上——所以这条命令随时可以重复执行。
+
+### 一个服务端都没上线
+
+```bash
+bash examples/qwen_cluster.sh diag
+```
+
+先看输出末尾的 bootstrap DHT:它要是 DEAD,所有服务端都会以同样的方式失败,
+先修它。每行的 `age=` 是那份日志多久没写了——DEAD 且 age 很老,说明你看到的是
+过去某次失败的残骸,不是此刻正在发生的问题。
+
+### 时钟
+
+`clock=` 那一列标了来源:`(ntp)` 是从该机自己的时间守护进程读的,毫秒级可信;
+`(rtt)` 是 SSH 往返估的,误差可能有一两秒,判定时会先扣掉误差棒,所以它不会
+因为噪声把健康节点拦下来。全部 `(ntp)` 且 `ok` 就别管时钟。
+
+---
+
+## 6. 停止
+
+```bash
+bash examples/qwen_cluster.sh stop        # 服务端 + DHT
+bash examples/qwen_cluster.sh proxy stop  # 代理
+```
+
+bootstrap 的身份文件保留,下次 `start` 的 peer 地址不变,客户端不用改。
