@@ -458,6 +458,13 @@ case \"\$net\" in *cdn=ok*) ;; *) exit 1 ;; esac
        || "$line" != *hub=ok* || "$line" != *cdn=ok* ]] \
       && bad=$((bad + 1))
   done
+  local live; live=$(servers_running)
+  if (( live )); then
+    echo
+    echo "NOTE: $live host(s) are running a server, so vram_free above is what is left AFTER" >&2
+    echo "them. Do not size 'plan' from this run -- stop the servers and re-run preflight." >&2
+  fi
+
   echo
   if (( bad )); then
     echo "$bad host(s) are not ready. Fix those before running deploy." >&2
@@ -1344,6 +1351,45 @@ journalctl --user -u $SERVICE_NAME.service -n ${2:-40} --no-pager" || true
   esac
 }
 
+# vram_free is what the GPU has left right now. With servers running that is what is left
+# AFTER they took theirs, so sizing from it produces numbers a fraction of the truth -- and
+# plan --write bakes them into hosts.txt, where the next start honours them. Refuse instead.
+servers_running() {
+  local n=0 i
+  fanout planguard "
+if [ -f '$REMOTE_DIR/run/server.pid' ] && kill -0 \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null
+then echo running; else echo stopped; fi
+" >/dev/null 2>&1 || true
+  for i in "${!IDS[@]}"; do
+    [[ "$(tail -1 "$STATE_DIR/out/${IDS[$i]}.planguard" 2>/dev/null)" == running ]] && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+cmd_plan() {
+  local arg force=0
+  for arg in "$@"; do [[ "$arg" == --force ]] && force=1; done
+  local running; running=$(servers_running)
+  if (( running && ! force )); then
+    echo "$running of ${#IDS[@]} hosts are running a server right now." >&2
+    echo "" >&2
+    echo "plan sizes each host from its FREE VRAM, and a running server has already taken" >&2
+    echo "most of it -- planning now yields a fraction of each card's real capacity and" >&2
+    echo "--write would put those numbers in $HOSTS_FILE. Stop the servers, re-run" >&2
+    echo "preflight so vram_free is measured on idle cards, then plan:" >&2
+    echo "" >&2
+    echo "  bash examples/qwen_cluster.sh service stop   # or: stop" >&2
+    echo "  bash examples/qwen_cluster.sh preflight" >&2
+    echo "  bash examples/qwen_cluster.sh plan --cap 8 --write" >&2
+    echo "" >&2
+    echo "Pass --force only if you know the figures are from idle cards." >&2
+    return 2
+  fi
+  local passthrough=()
+  for arg in "$@"; do [[ "$arg" != --force ]] && passthrough+=("$arg"); done
+  python3 examples/plan_blocks.py --state-dir "$STATE_DIR" --hosts-file "$HOSTS_FILE" "${passthrough[@]}"
+}
+
 cmd_stop() {
   local with_dht=0
   [[ "${1:-}" == --dht || "${1:-}" == --all ]] && with_dht=1
@@ -1376,8 +1422,7 @@ if [ -f run/dht.pid ]; then kill \$(cat run/dht.pid) 2>/dev/null || true; rm -f 
 case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
   synctime) shift; cmd_synctime "$@" ;;
-  plan)   shift; python3 examples/plan_blocks.py --state-dir "$STATE_DIR" \
-            --hosts-file "$HOSTS_FILE" "$@" ;;
+  plan)   shift; cmd_plan "$@" ;;
   deploy) shift; cmd_deploy "$@" ;;
   start)  shift; cmd_start "$@" ;;
   status) shift; cmd_status "$@" ;;
