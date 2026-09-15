@@ -270,6 +270,7 @@ cmd_synctime() {
 # Everything deploy needs but does not install. Read-only: touches nothing on the hosts.
 cmd_preflight() {
   local interp="${NODE_PY:-$PY}"
+  ensure_proxy_addr
   echo "Checking ${#IDS[@]} hosts against interpreter: $interp"
 
   # Sent base64 so the quoting survives two levels of shell.
@@ -533,6 +534,7 @@ venv/bin/python -c 'import petals, torch; print(\"{ID}\", petals.__version__, to
 
 cmd_start() {
   mkdir -p "$STATE_DIR/out"
+  ensure_proxy_addr
   local restart=0
   [[ "${1:-}" == --restart ]] && restart=1
 
@@ -936,6 +938,22 @@ proxy_addr() {
 # them because they already have their own egress and need not add load to that uplink.
 # HTTP_PROXY is deliberately left unset: the proxy speaks CONNECT only, so pointing plain
 # HTTP at it would turn a working request into a 405.
+# The cached address is a convenience, not the truth. Losing the file silently switched the
+# proxy off for twelve hosts and read as a network outage; ask the proxy node instead. Done
+# once per command rather than per host, so it costs one round trip, not fifteen.
+ensure_proxy_addr() {
+  [[ -f "$STATE_DIR/proxy_addr" ]] && return 0
+  local i; i=$(find_index "$PROXY_NODE") || return 0
+  local alive
+  alive=$(remote "${IPS[$i]}" \
+    "[ -f '$REMOTE_DIR/run/proxy.pid' ] && kill -0 \$(cat '$REMOTE_DIR/run/proxy.pid') 2>/dev/null && echo yes" \
+    2>/dev/null || true)
+  [[ "$alive" == yes ]] || return 0
+  mkdir -p "$STATE_DIR"
+  printf 'http://%s:%s\n' "${IPS[$i]}" "$PROXY_PORT" > "$STATE_DIR/proxy_addr"
+  echo "Recovered the proxy address from $PROXY_NODE: http://${IPS[$i]}:$PROXY_PORT"
+}
+
 proxy_applies_to() {
   local id="$1" addr skip
   addr=$(proxy_addr)
@@ -1137,6 +1155,14 @@ cmd_service() {
         echo "No bootstrap address; run 'start' once before installing units." >&2; exit 1
       }
       local bnode_idx=""; bnode_idx=$(find_index "$BOOTSTRAP_NODE") || true
+      ensure_proxy_addr
+      # The env files are written once and then used on every restart, so a proxy missing
+      # here is baked into the units until someone reinstalls them.
+      if [[ -z "$(proxy_addr)" ]]; then
+        echo "No proxy registered: the units will be written WITHOUT HTTPS_PROXY." >&2
+        echo "Hosts without their own egress will retry the Hub forever. Run 'proxy start'" >&2
+        echo "first unless every host can reach it directly." >&2
+      fi
 
       local i
       for i in "${!IDS[@]}"; do
@@ -1258,6 +1284,10 @@ systemctl --user daemon-reload
       echo "systemctl --user $action $SERVICE_NAME ..."
       fanout "svc-$action" "
 $SYSTEMD_ENV
+# A unit that tripped StartLimitBurst stays in failed state and refuses to start until the
+# counter is cleared. Without this, 'service start' silently does nothing on exactly the
+# hosts that need it most.
+systemctl --user reset-failed $SERVICE_NAME.service >/dev/null 2>&1 || true
 if [ -f '$REMOTE_DIR/run/server.pid' ] && ! systemctl --user is-active --quiet $SERVICE_NAME 2>/dev/null; then
   kill \$(cat '$REMOTE_DIR/run/server.pid') 2>/dev/null || true
   sleep 5
