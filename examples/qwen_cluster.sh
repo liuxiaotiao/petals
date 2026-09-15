@@ -7,8 +7,14 @@
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
 #   examples/qwen_cluster.sh diag      # why is nothing online: alive? downloading? crashed?
+#   examples/qwen_cluster.sh cleanup   # list stale/GPU-holding processes (kills nothing)
+#   examples/qwen_cluster.sh cleanup --ours --yes   # kill this deployment's leftovers
+#   examples/qwen_cluster.sh cleanup --gpu  --yes   # ALSO kill other processes on the GPU
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
 #   examples/qwen_cluster.sh stop      # stop servers, then the DHT
+#
+# CLEANUP_ON_START=gpu makes 'start' first kill every foreign process holding GPU
+# memory. Only set it where this cluster owns the GPUs outright.
 #
 # Hosts come from task/hosts.txt: "<id> <ip>:<petals_port> [blocks=N]  # comment".
 # blocks=N overrides NUM_BLOCKS for that one host, so a 16 GB card can serve fewer
@@ -65,7 +71,10 @@ index_of() {
 }
 
 remote() {  # remote <ip> <shell-command>
-  $SSH $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@$1" "$2"
+  # -n detaches stdin. Without it, a remote command that tries to read the terminal
+  # (sudo asking for a password, say) gets SIGTTIN and the whole backgrounded fanout
+  # silently stops instead of failing. rsync must NOT get -n, so it is set here only.
+  $SSH -n $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@$1" "$2"
 }
 
 # Run one command on every host at once; report which hosts failed.
@@ -99,6 +108,7 @@ cmd_preflight() {
   # Sent base64 so the quoting survives two levels of shell.
   local probe_b64
   probe_b64=$(base64 <<'PROBE' | tr -d '\n'
+import os
 import urllib.error
 import urllib.request
 
@@ -126,11 +136,10 @@ try:
 except Exception as exc:
     free = "ERR-%s" % type(exc).__name__
 # huggingface.co serves the index; Xet-backed repos serve the actual bytes from xethub.
-print("hub=%s xet=%s vram_free=%s" % (
-    probe("https://huggingface.co/api/models"),
-    probe("https://cas-server.xethub.hf.co"),
-    free,
-))
+# With HF_HUB_DISABLE_XET set, downloads fall back to the regular CDN and xethub is
+# irrelevant, so probing it would only produce a blocker that is already handled.
+xet = "disabled" if os.environ.get("QWEN_SKIP_XET") else probe("https://cas-server.xethub.hf.co")
+print("hub=%s xet=%s vram_free=%s" % (probe("https://huggingface.co/api/models"), xet, free))
 PROBE
 )
 
@@ -181,7 +190,8 @@ fi
 timeout 25 '$interp' -m pip download --no-deps -d /tmp/.qwen-pipcheck packaging >/dev/null 2>&1 \
   && pypi=ok || pypi=UNREACHABLE
 rm -rf /tmp/.qwen-pipcheck
-net=\$(echo '$probe_b64' | base64 -d > /tmp/.qwen_probe.py && timeout 45 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
+net=\$(echo '$probe_b64' | base64 -d > /tmp/.qwen_probe.py && \
+  QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' timeout 45 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
 rm -f /tmp/.qwen_probe.py
 disk=\$(df -Pk \"\$HOME\" | awk 'NR==2 {printf \"%.0fG\", \$4/1048576}')
 echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi \${net:-hub=? xet=? vram_free=?} disk_free=\$disk\"
@@ -194,21 +204,27 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     local line skew mark
     line=$(tail -1 "$STATE_DIR/out/${IDS[$i]}.preflight" 2>/dev/null)
     skew="${skews[$i]}"
-    # hivemind's own limit is 3s; flag at 2s so there is margin.
-    if [[ "$skew" == "?" ]] || awk -v s="$skew" 'BEGIN {exit !(s < -2 || s > 2)}'; then
+    # hivemind drops peers >3s apart. 2-3s still works but has no margin, so warn
+    # without failing the host on it.
+    if [[ "$skew" == "?" ]] || awk -v s="$skew" 'BEGIN {exit !(s < -3 || s > 3)}'; then
       mark="CLOCK-SKEW"
+    elif awk -v s="$skew" 'BEGIN {exit !(s < -2 || s > 2)}'; then
+      mark="clock-marginal"
     else
       mark="ok"
     fi
     printf '  %s clock=%ss-vs-%s/%s\n' \
       "${line:-${IDS[$i]} no-response}" "$skew" "$BOOTSTRAP_NODE" "$mark"
-    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" != ok ]] && bad=$((bad + 1))
+    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" == CLOCK-SKEW ]] \
+      && bad=$((bad + 1))
   done
   echo
   if (( bad )); then
     echo "$bad host(s) are not ready. Fix those before running deploy." >&2
     echo "  CLOCK-SKEW  -> hivemind drops peers >3s apart; sync NTP (chrony / systemd-timesyncd)" >&2
-    echo "  xet=UNREACHABLE -> set HF_HUB_DISABLE_XET=1, or allow *.xethub.hf.co through egress" >&2
+    echo "  xet=UNREACHABLE -> export HF_HUB_DISABLE_XET=1 and re-run; that makes this check pass" >&2
+    echo "  vram_free=ERR-* -> CUDA context could not be created; the GPU is full or wedged" >&2
+    echo "  (clock-marginal is a warning only and does not block deploy)" >&2
     return 1
   fi
   echo "All hosts are ready for deploy."
@@ -265,6 +281,15 @@ venv/bin/python -c 'import petals, torch; print(\"{ID}\", petals.__version__, to
 
 cmd_start() {
   mkdir -p "$STATE_DIR/out"
+
+  # Freeing the GPUs comes first: it is independent of the DHT, and a server that
+  # starts onto an occupied card just OOMs. Kills only foreign GPU holders; our own
+  # running servers are left to the already-running check further down.
+  if [[ "${CLEANUP_ON_START:-}" == gpu ]]; then
+    echo "CLEANUP_ON_START=gpu: freeing GPUs held by other processes ..."
+    cmd_cleanup --gpu --yes
+  fi
+
   local b; b=$(index_of "$BOOTSTRAP_NODE")
   local bip="${IPS[$b]}"
 
@@ -298,6 +323,20 @@ echo \$! > run/dht.pid
               HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     [[ -n "${!name:-}" ]] && passthrough+="$name='${!name}' "
   done
+
+  # A server from an earlier run whose pidfile was lost would fight this one for the
+  # port and the GPU. These match this deployment's own venv, so they are ours to kill.
+  echo "Clearing stale servers from earlier runs ..."
+  fanout clearstale "
+venv_python=\"\$HOME/$REMOTE_DIR/venv/bin/python\"
+if [ -f \"\$HOME/$REMOTE_DIR/run/server.pid\" ] && kill -0 \$(cat \"\$HOME/$REMOTE_DIR/run/server.pid\") 2>/dev/null
+then echo '{ID} running-already'; exit 0; fi
+for pid in \$(pgrep -f \"\$venv_python -m petals\\.cli\\.run_server\" 2>/dev/null); do
+  [ \"\$pid\" = \"\$\$\" ] && continue
+  kill -TERM \"\$pid\" 2>/dev/null || true
+done
+echo '{ID} cleared'
+" || true
 
   echo "Starting ${#IDS[@]} servers ..."
   fanout start "
@@ -363,6 +402,83 @@ echo \"{ID} \$alive cache=\${cache:-0} lines=\$lines | \${last:-no error lines}\
   echo "full log: bash examples/qwen_cluster.sh logs <node-id> 80"
 }
 
+# List, and optionally kill, processes that would get in a fresh start's way.
+#   (no flags)     dry run: show everything, kill nothing
+#   --ours         processes launched from this deployment's venv -- always safe to kill
+#   --gpu          ANY process holding GPU memory, including other people's jobs
+#   --yes          actually kill; without it this only reports
+cmd_cleanup() {
+  local want_ours=0 want_gpu=0 confirm=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --ours) want_ours=1 ;;
+      --gpu)  want_gpu=1 ;;
+      --yes)  confirm=1 ;;
+      *) echo "cleanup: unknown flag $arg" >&2; return 2 ;;
+    esac
+  done
+  (( want_ours || want_gpu )) || { want_ours=1; want_gpu=1; }   # dry run shows both
+
+  if (( confirm && want_gpu )); then
+    echo "WARNING: --gpu --yes kills every process holding GPU memory on all ${#IDS[@]} hosts," >&2
+    echo "including jobs that are not yours. Run without --yes first and read the list." >&2
+  fi
+
+  fanout cleanup "
+venv_python=\"\$HOME/$REMOTE_DIR/venv/bin/python\"
+report() {  # report <pid> <tag> <extra>
+  info=\$(ps -o user=,etime=,args= -p \"\$1\" 2>/dev/null | head -1 | cut -c1-110)
+  [ -n \"\$info\" ] && echo \"{ID} pid=\$1 \$2 \$3 \$info\"
+}
+kill_pid() {
+  kill -TERM \"\$1\" 2>/dev/null || return 0
+  for _ in 1 2 3 4 5; do kill -0 \"\$1\" 2>/dev/null || return 0; sleep 1; done
+  kill -KILL \"\$1\" 2>/dev/null || true
+}
+
+ours=\$(pgrep -f \"\$venv_python -m petals\\.cli\\.run_\" 2>/dev/null | grep -vx \"\$\$\" | tr '\\n' ' ')
+gpu_pids=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | tr '\\n' ' ')
+
+for pid in \$ours; do
+  mem=\"\"
+  for g in \$gpu_pids; do [ \"\$g\" = \"\$pid\" ] && mem=on-gpu; done
+  report \"\$pid\" OURS \"\$mem\"
+  [ '$want_ours$confirm' = '11' ] && kill_pid \"\$pid\"
+done
+for pid in \$gpu_pids; do
+  mine=0
+  for o in \$ours; do [ \"\$o\" = \"\$pid\" ] && mine=1; done
+  [ \"\$mine\" = 1 ] && continue
+  mb=\$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null \
+        | awk -F, -v p=\"\$pid\" '\$1+0==p {gsub(/ /,\"\",\$2); print \$2}')
+  report \"\$pid\" OTHER \"\$mb\"
+  [ '$want_gpu$confirm' = '11' ] && kill_pid \"\$pid\"
+done
+echo '{ID} done'
+" || true
+
+  echo
+  local id shown=0
+  for id in "${IDS[@]}"; do
+    local file="$STATE_DIR/out/$id.cleanup"
+    [[ -f "$file" ]] || continue
+    while IFS= read -r line; do
+      [[ "$line" == *" done" ]] && continue
+      printf '  %s\n' "$line"
+      shown=$((shown + 1))
+    done < "$file"
+  done
+  (( shown )) || { echo "  nothing running on any host"; return 0; }
+  echo
+  if (( confirm )); then
+    echo "Killed the processes listed above (OURS$( ((want_gpu)) && echo " and OTHER" ))."
+  else
+    echo "Dry run -- nothing was killed. To act:"
+    echo "  cleanup --ours --yes   # only this deployment's own leftovers"
+    echo "  cleanup --gpu  --yes   # also other processes holding GPU memory"
+  fi
+}
+
 cmd_logs() {
   local id="${1:?usage: logs <node-id> [lines]}" lines="${2:-60}"
   local i; i=$(index_of "$id")
@@ -393,10 +509,11 @@ case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   status) shift; cmd_status "$@" ;;
   diag)   shift; cmd_diag "$@" ;;
+  cleanup) shift; cmd_cleanup "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \
               "${NBLOCKS[$i]:-(NUM_BLOCKS)}"; done ;;
-  *) sed -n '2,15p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,18p' "$0" >&2; exit 2 ;;
 esac

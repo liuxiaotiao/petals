@@ -134,6 +134,7 @@ bash examples/qwen_cluster.sh deploy   # rsync 本仓库到 15 台，各自建 v
 bash examples/qwen_cluster.sh start    # 起 DHT，抓引导地址，再并发起 15 个服务端
 bash examples/qwen_cluster.sh status --watch   # 轮询到 40 层全覆盖为止
 bash examples/qwen_cluster.sh diag             # 没有服务端上线时先跑这个
+bash examples/qwen_cluster.sh cleanup         # 列出残留/占卡进程，默认不杀
 bash examples/qwen_cluster.sh logs N07 100     # 看某台的日志
 bash examples/qwen_cluster.sh stop             # 停服务端，再停 DHT
 ```
@@ -191,6 +192,32 @@ GPU 不可见的节点显示 `NO-CUDA`——这一步同时充当上真机前的
 ```
 
 任何一项是 `MISSING` / `UNREACHABLE` 就返回非零并指出有几台不合格，先修好再 `deploy`。
+
+### 清理占用进程
+
+`cleanup` 把进程分成两类，**默认只列不杀**：
+
+- **OURS** —— 命令行里带本部署 venv 路径（`~/petals-qwen/venv/bin/python`）的进程，
+  按定义就是这套部署自己起的，杀掉没有副作用。
+- **OTHER** —— 占着显存但不是我们起的，可能是别人在跑的任务。
+
+```bash
+bash examples/qwen_cluster.sh cleanup              # 先看清单
+bash examples/qwen_cluster.sh cleanup --ours --yes # 只清自己的残留
+bash examples/qwen_cluster.sh cleanup --gpu  --yes # 连别人的一起杀（会先警告）
+```
+
+```
+  N02 pid=2943 OTHER 24110MiB ubuntu  5-03:22:11 /home/ubuntu/anaconda3/envs/moe/bin/python train.py
+  N06 pid=8871 OURS  on-gpu   ubuntu     01:12:04 /home/ubuntu/petals-qwen/venv/bin/python -m petals.cli.run_server
+```
+
+`ps` 里的 `etime`（已运行时长）和完整命令行都会打出来，方便判断 OTHER 到底是残留还是在跑的任务。
+杀的时候先 SIGTERM，等 5 秒不退再 SIGKILL。
+
+`start` 现在会自动做一次 **OURS 范围内**的清理：上一轮 pidfile 丢失的孤儿服务端会被 SIGTERM
+掉再启动，否则它们会和新进程抢端口和显存。这一步只认本部署的 venv 路径，不会碰别人的进程，
+也不会碰引导节点的 `run_dht`。
 
 ### 一个服务端都没上线时
 
