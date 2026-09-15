@@ -1198,6 +1198,10 @@ StartLimitBurst=5
 Type=simple
 WorkingDirectory=%h/$REMOTE_DIR/repo
 EnvironmentFile=%h/$REMOTE_DIR/run/server.env
+# One server per host. A survivor of the previous generation keeps its GPU memory and its
+# port, so the replacement OOMs on load or splits connections with it; systemd restarts
+# without this script, so the guarantee belongs here.
+ExecStartPre=-/bin/sh -c 'pkill -9 -f \"petals[.]cli[.]run_server\" || true; sleep 2'
 ExecStart=/bin/bash examples/run_qwen_server.sh
 # Keep the pidfile the other subcommands read, so status/diag/cleanup still work.
 ExecStartPost=/bin/sh -c 'echo \\\${MAINPID} > %h/$REMOTE_DIR/run/server.pid'
@@ -1246,6 +1250,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/$REMOTE_DIR
+# Same rule, and worse when broken: two DHTs on one port split the swarm's view, so
+# servers announce into one and clients read the other.
+ExecStartPre=-/bin/sh -c 'pkill -9 -f \"petals[.]cli[.]run_dht\" || true; sleep 2'
 ExecStart=%h/$REMOTE_DIR/venv/bin/python -m petals.cli.run_dht \\
   --host_maddrs /ip4/0.0.0.0/tcp/$DHT_PORT \\
   --announce_maddrs /ip4/${IPS[$bnode_idx]}/tcp/$DHT_PORT \\
