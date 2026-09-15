@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--hosts-file", default="task/hosts.txt")
     parser.add_argument("--max-disk-gb", type=float, default=30.0, help="matches MAX_DISK_SPACE")
     parser.add_argument("--num-layers", type=int, default=40)
+    parser.add_argument("--cap", type=int, default=None,
+                        help="ceiling per host; sizing to the last layer that fits leaves no\nroom for activation peaks, and fewer layers per host also means less to download")
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()
 
@@ -68,7 +70,10 @@ def main():
             continue
         by_vram = blocks_from_vram(vram)
         by_disk = blocks_from_disk(disk, args.max_disk_gb)
-        limits[node] = (min(by_vram, by_disk), by_vram, by_disk)
+        allowed = min(by_vram, by_disk)
+        if args.cap is not None:
+            allowed = min(allowed, args.cap)
+        limits[node] = (allowed, by_vram, by_disk)
 
     print(f"{'node':5s} {'blocks':>6s} {'by vram':>8s} {'by disk':>8s}   limited by")
     total = 0
@@ -78,7 +83,10 @@ def main():
             unknown.append(node)
             print(f"{node:5s} {'?':>6s} {'?':>8s} {'?':>8s}   preflight did not report free space")
             continue
-        who = "vram" if by_vram <= by_disk else "disk"
+        if args.cap is not None and n == args.cap and n < min(by_vram, by_disk):
+            who = "--cap"
+        else:
+            who = "vram" if by_vram <= by_disk else "disk"
         note = "  <- cannot serve anything" if n == 0 else ""
         print(f"{node:5s} {n:>6d} {by_vram:>8d} {by_disk:>8d}   {who}{note}")
         total += n
