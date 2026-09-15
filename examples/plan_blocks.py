@@ -126,6 +126,11 @@ def main():
         body, _, comment = line.partition("#")
         fields = body.split()
         node, addr = fields[0], fields[1]
+        # "blocks=start:end" pins a host to an exact range, which is a deliberate choice
+        # (usually to close a gap the rebalancer will not fill). Sizing must not undo it.
+        if any(f.startswith("blocks=") and ":" in f for f in fields[2:]):
+            out.append(line)
+            continue
         n = limits.get(node, (None,))[0]
         if n is None:  # keep whatever was there
             out.append(line)

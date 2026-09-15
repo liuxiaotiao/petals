@@ -90,6 +90,14 @@ find_index() {
   return 1
 }
 
+# A host's layer setting, as the variable run_qwen_server.sh expects: a count becomes
+# NUM_BLOCKS and the swarm places it, while "start:end" becomes BLOCKS and pins it there.
+blocks_var_for() {  # blocks_var_for <index>
+  local value="${NBLOCKS[$1]}"
+  [[ -z "$value" ]] && return 0
+  if [[ "$value" == *:* ]]; then printf 'BLOCKS=%s' "$value"; else printf 'NUM_BLOCKS=%s' "$value"; fi
+}
+
 index_of() {
   local i
   i=$(find_index "$1") || { echo "Unknown node id: $1" >&2; exit 2; }
@@ -124,7 +132,7 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
     cmd="${cmd//\{IP\}/${IPS[$i]}}"
     cmd="${cmd//\{PORT\}/${PORTS[$i]}}"
     # Empty unless this host pinned its own layer count; placed last so it wins.
-    local nb=""; [[ -n "${NBLOCKS[$i]}" ]] && nb="NUM_BLOCKS='${NBLOCKS[$i]}' "
+    local nb=""; [[ -n "${NBLOCKS[$i]}" ]] && nb="$(blocks_var_for "$i") "
     cmd="${cmd//\{NBLOCKS\}/$nb}"
     cmd="${cmd//\{PROXY\}/$(proxy_env_for "${IDS[$i]}")}"
     remote "${IPS[$i]}" "$cmd" > "$STATE_DIR/out/${IDS[$i]}.$label" 2>&1 &
@@ -1138,10 +1146,10 @@ service_env() {  # service_env <index> <peer>
   printf 'MODEL_NAME=%s\n' "$MODEL_NAME"
   printf 'MAX_DISK_SPACE=%s\n' "$MAX_DISK_SPACE"
   # The host's own blocks= wins over a NUM_BLOCKS inherited from this shell.
-  if [[ -n "${NBLOCKS[$i]}" ]]; then printf 'NUM_BLOCKS=%s\n' "${NBLOCKS[$i]}"; fi
+  if [[ -n "${NBLOCKS[$i]}" ]]; then printf '%s\n' "$(blocks_var_for "$i")"; fi
   for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY DHT_PREFIX MODEL_REVISION \
               HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN; do
-    [[ "$name" == NUM_BLOCKS && -n "${NBLOCKS[$i]}" ]] && continue
+    [[ "$name" == NUM_BLOCKS || "$name" == BLOCKS ]] && [[ -n "${NBLOCKS[$i]}" ]] && continue
     [[ -n "${!name:-}" ]] && printf '%s=%s\n' "$name" "${!name}"
   done
   if proxy_applies_to "${IDS[$i]}"; then
@@ -1174,7 +1182,9 @@ cmd_service() {
       local i
       for i in "${!IDS[@]}"; do
         local id="${IDS[$i]}"
-        printf '%-5s ' "$id"
+        local shows="blocks=${NBLOCKS[$i]:-auto}"
+        proxy_applies_to "$id" && shows+=" proxy=yes" || shows+=" proxy=no"
+        printf '%-5s %-22s ' "$id" "$shows"
         # The unit text is built here, fully substituted, so nothing extra has to be
         # deployed and there is one place to read when the behaviour is in question.
         remote "${IPS[$i]}" "
