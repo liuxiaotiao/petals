@@ -193,6 +193,50 @@ GPU 不可见的节点显示 `NO-CUDA`——这一步同时充当上真机前的
 
 任何一项是 `MISSING` / `UNREACHABLE` 就返回非零并指出有几台不合格，先修好再 `deploy`。
 
+### 部分节点没有外网出口
+
+权重从 Hugging Face 下载，而集群里常常只有一部分节点能出外网。`preflight` 的
+`cdn=` 那一列量的就是这件事：它沿当前 `HF_ENDPOINT` 取一次模型索引，再对真实分片发
+一个 `Range: bytes=0-0`，能拿到那一个字节才算 `ok`。只 ping 域名是不够的——典型故障
+恰恰是 API 通、内容 CDN 被挡，那样服务端会抱着空缓存无限重试，而不是干脆报错。
+
+失败会带上原因后缀，三类修法完全不同：
+
+| 后缀 | 含义 | 修法 |
+|---|---|---|
+| `-TimeoutError` / `-ConnectionRefusedError` | 防火墙拦掉了 | 放行，或用下面的代理 |
+| `-SSLCertVerificationError` | 有 TLS 中间人，解释器不信它的 CA | 给 Python 指向系统 CA（**不要**关校验） |
+| `-gaierror` | DNS 解析不了 | 查这台机器的 resolver |
+| `NO-INDEX-404` | 该端点没收录这个仓库 | 换端点 |
+| `NO-INDEX-401/403` | 仓库是 gated | 接受条款并设 `HF_TOKEN` |
+
+只要有**一台**节点能出外网，就不必动防火墙：让它把出口借给其他人。
+
+```bash
+PROXY_NODE=N08 bash examples/qwen_cluster.sh proxy start
+bash examples/qwen_cluster.sh preflight      # 应当全部转为 cdn=ok
+```
+
+`proxy start` 在 `PROXY_NODE` 上拉起 `examples/qwen_http_proxy.py`——一个只讲 CONNECT
+的转发代理，纯标准库，不装包、不用 sudo。之后 `preflight` 和 `start` 会给其余每台节点
+带上 `HTTPS_PROXY` 指向它；`huggingface_hub` 走 `requests`，`requests` 认这个变量，所以
+**不需要改层分配、也不需要额外存一份权重**，Petals 照旧自己挑层范围、照旧再平衡。
+
+几点值得知道：
+
+- 代理只接受 `HOSTS_FILE` 里的地址、只放行 80/443。局域网上开一个无限制代理是真实风险，
+  而这里客户端集合是完全已知的，白名单不花任何代价。被拒时会回一个带说明的 403，而不是
+  直接闭连——后者到客户端只剩一句 `RemoteDisconnected`，等于没说。
+  非常规端口或有 NAT 改写源地址时，用 `PROXY_PORTS` / `PROXY_ALLOW` 放宽。
+- `NO_PROXY` 会包含所有节点地址，所以集群内部流量不经过代理。Petals 的 P2P 本来就不是
+  HTTP，不受影响。
+- 代价是**全部下载量压在这一条上行链路上**（15 台 × 各自的分片，总量远大于模型本身的
+  72 GB）。如果外网带宽才是瓶颈，更省流量的做法是让这台节点逐个分片下载再 rsync 分发，
+  外网只走 72 GB——但那要求提前知道每台要哪些分片，也就是把层范围钉死，代价是失去自动
+  再平衡。
+- `PROXY_SKIP="N06 N07"` 让本来就有出口的节点直连，别给那条链路添堵。
+- 用完 `proxy stop`；`proxy logs` 看它到底转了些什么。
+
 ### 清理占用进程
 
 `cleanup` 把进程分成两类，**默认只列不杀**：

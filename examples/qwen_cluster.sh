@@ -6,6 +6,7 @@
 #                                     # there is one; --yes steps unsynced clocks to the bootstrap
 #   examples/qwen_cluster.sh plan      # size each host's blocks= from its free VRAM/disk
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
+#   examples/qwen_cluster.sh proxy start  # lend PROXY_NODE's egress to hosts that have none
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
 #   examples/qwen_cluster.sh diag      # why is nothing online: alive? downloading? crashed?
@@ -34,6 +35,13 @@ SSH="${QWEN_SSH:-ssh}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
 REMOTE_DIR="${REMOTE_DIR:-petals-qwen}"          # relative to the remote user's home
 BOOTSTRAP_NODE="${BOOTSTRAP_NODE:-N01}"
+# The node that lends its egress to the rest. It needs to reach the Hub and to be
+# reachable from the other hosts; nothing else.
+PROXY_NODE="${PROXY_NODE:-N08}"
+PROXY_PORT="${PROXY_PORT:-8899}"
+PROXY_SKIP="${PROXY_SKIP:-}"            # node ids with their own egress, space separated
+PROXY_ALLOW="${PROXY_ALLOW:-}"          # client IPs; empty means every host in HOSTS_FILE
+PROXY_PORTS="${PROXY_PORTS:-80,443}"    # destination ports the proxy will open
 DHT_PORT="${DHT_PORT:-31337}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
 # Hub cache ceiling per host. A contiguous 11-layer range needs at most 25.5 GB of shard
@@ -90,6 +98,7 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
     # Empty unless this host pinned its own layer count; placed last so it wins.
     local nb=""; [[ -n "${NBLOCKS[$i]}" ]] && nb="NUM_BLOCKS='${NBLOCKS[$i]}' "
     cmd="${cmd//\{NBLOCKS\}/$nb}"
+    cmd="${cmd//\{PROXY\}/$(proxy_env_for "${IDS[$i]}")}"
     remote "${IPS[$i]}" "$cmd" > "$STATE_DIR/out/${IDS[$i]}.$label" 2>&1 &
     pids+=($!)
   done
@@ -381,7 +390,7 @@ timeout 25 '$interp' -m pip download --no-deps -d /tmp/.qwen-pipcheck packaging 
   && pypi=ok || pypi=UNREACHABLE
 rm -rf /tmp/.qwen-pipcheck
 net=\$(echo '$probe_b64' | base64 -d > /tmp/.qwen_probe.py && \
-  QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' HF_ENDPOINT='${HF_ENDPOINT:-}' QWEN_MODEL='$MODEL_NAME' QWEN_REVISION='${MODEL_REVISION:-}' timeout 75 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
+  {PROXY}QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' HF_ENDPOINT='${HF_ENDPOINT:-}' QWEN_MODEL='$MODEL_NAME' QWEN_REVISION='${MODEL_REVISION:-}' timeout 75 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
 rm -f /tmp/.qwen_probe.py
 disk=\$(df -Pk \"\$HOME\" | awk 'NR==2 {printf \"%.0fG\", \$4/1048576}')
 echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi \${net:-hub=? xet=? vram_free=?} disk_free=\$disk\"
@@ -564,7 +573,7 @@ cd '$REMOTE_DIR'
 if [ -f run/server.pid ] && kill -0 \$(cat run/server.pid) 2>/dev/null; then echo already-running; exit 0; fi
 cd repo
 BOOTSTRAP_PEER='$peer' ANNOUNCE_IP='{IP}' PORT='{PORT}' \
-MODEL_NAME='$MODEL_NAME' MAX_DISK_SPACE='$MAX_DISK_SPACE' $passthrough {NBLOCKS}\
+MODEL_NAME='$MODEL_NAME' MAX_DISK_SPACE='$MAX_DISK_SPACE' $passthrough {NBLOCKS}{PROXY}\
 CACHE_DIR=\"\$HOME/$REMOTE_DIR/cache\" PYTHON=\"\$HOME/$REMOTE_DIR/venv/bin/python\" \
 nohup bash examples/run_qwen_server.sh > \"\$HOME/$REMOTE_DIR/logs/server.log\" 2>&1 &
 echo \$! > \"\$HOME/$REMOTE_DIR/run/server.pid\"
@@ -735,6 +744,114 @@ cmd_logs() {
   remote "${IPS[$i]}" "tail -n $lines '$REMOTE_DIR/logs/server.log'"
 }
 
+# Give every host without egress a way to the Hub through one that has it.
+#
+# HTTPS_PROXY is the whole mechanism: huggingface_hub goes through requests, requests
+# honours it, and this script already forwards it to the servers. So one node with egress
+# serves the cluster without touching the firewall, without pinning block ranges, and
+# without a separate copy of the weights -- Petals keeps choosing its own layer ranges.
+# The cost is that every host's download crosses that one node's uplink.
+proxy_addr() {
+  # Always succeeds: under set -e an assignment from a failing substitution kills the
+  # caller, and "no proxy configured" is an ordinary state, not an error.
+  [[ -f "$STATE_DIR/proxy_addr" ]] || return 0
+  cat "$STATE_DIR/proxy_addr"
+}
+
+# Hosts reach the Hub through the proxy unless they are the proxy, or PROXY_SKIP exempts
+# them because they already have their own egress and need not add load to that uplink.
+# HTTP_PROXY is deliberately left unset: the proxy speaks CONNECT only, so pointing plain
+# HTTP at it would turn a working request into a 405.
+proxy_env_for() {
+  local id="$1" addr skip
+  addr=$(proxy_addr) || return 0
+  [[ -n "$addr" ]] || return 0
+  [[ "$id" == "$PROXY_NODE" ]] && return 0
+  for skip in $PROXY_SKIP; do [[ "$id" == "$skip" ]] && return 0; done
+  local direct; direct="localhost,127.0.0.1,$(IFS=,; echo "${IPS[*]}")"
+  printf "HTTPS_PROXY='%s' https_proxy='%s' NO_PROXY='%s' no_proxy='%s' " \
+    "$addr" "$addr" "$direct" "$direct"
+}
+
+cmd_proxy() {
+  local action="${1:-status}"
+  local i; i=$(index_of "$PROXY_NODE")
+  local ip="${IPS[$i]}"
+  local allow="${PROXY_ALLOW:-$(IFS=,; echo "${IPS[*]}")}"
+
+  case "$action" in
+    start)
+      remote "$ip" "
+set -e
+cd '$REMOTE_DIR'
+mkdir -p run logs
+if [ -f run/proxy.pid ] && kill -0 \$(cat run/proxy.pid) 2>/dev/null; then echo already-running; exit 0; fi
+nohup venv/bin/python repo/examples/qwen_http_proxy.py --port $PROXY_PORT --allow '$allow' --ports '$PROXY_PORTS' \
+  > logs/proxy.log 2>&1 &
+echo \$! > run/proxy.pid
+sleep 1
+if kill -0 \$(cat run/proxy.pid) 2>/dev/null; then echo started; else echo FAILED; tail -5 logs/proxy.log; exit 1; fi
+"
+      mkdir -p "$STATE_DIR"
+      printf 'http://%s:%s\n' "$ip" "$PROXY_PORT" > "$STATE_DIR/proxy_addr"
+      echo "Proxy up: http://$ip:$PROXY_PORT (on $PROXY_NODE)"
+
+      # Starting is not the same as being reachable. Prove it from a host that needs it,
+      # before preflight reports fifteen failures that all have one cause.
+      local j; for j in "${!IDS[@]}"; do [[ "${IDS[$j]}" != "$PROXY_NODE" ]] && break; done
+      local endpoint="${HF_ENDPOINT:-https://huggingface.co}"
+      echo -n "Reachability from ${IDS[$j]}: "
+      remote "${IPS[$j]}" "
+HTTPS_PROXY='http://$ip:$PROXY_PORT' https_proxy='http://$ip:$PROXY_PORT' \
+'$REMOTE_DIR/venv/bin/python' -c \"
+import urllib.request as u
+try:
+    print('ok', u.urlopen('$endpoint/api/models/$MODEL_NAME', timeout=25).status)
+except Exception as exc:
+    print('FAILED', type(exc).__name__, getattr(exc, 'reason', ''))
+\"" || echo "FAILED (host unreachable)"
+      echo "Every other host now routes the Hub through it. Verify with: preflight"
+      ;;
+
+    stop)
+      remote "$ip" "
+cd '$REMOTE_DIR' 2>/dev/null || exit 0
+if [ -f run/proxy.pid ]; then kill \$(cat run/proxy.pid) 2>/dev/null || true; rm -f run/proxy.pid; fi
+echo stopped
+" || true
+      rm -f "$STATE_DIR/proxy_addr"
+      echo "Proxy stopped. Hosts go back to direct egress."
+      ;;
+
+    status)
+      echo -n "$PROXY_NODE ($ip:$PROXY_PORT): "
+      remote "$ip" "
+cd '$REMOTE_DIR' 2>/dev/null || { echo 'not deployed'; exit 0; }
+if [ -f run/proxy.pid ] && kill -0 \$(cat run/proxy.pid) 2>/dev/null; then
+  # grep -c prints 0 and still exits non-zero when nothing matches, so let it fail
+  # quietly rather than appending a second count behind the first.
+  tunnels=\$(grep -c ' -> ' logs/proxy.log 2>/dev/null || true)
+  echo \"running, \${tunnels:-0} tunnel(s) opened\"
+else
+  echo DEAD
+fi
+" || echo "(host unreachable)"
+      local addr; addr=$(proxy_addr)
+      if [[ -n "$addr" ]]; then
+        echo "Hosts routed through it: all except $PROXY_NODE${PROXY_SKIP:+ and $PROXY_SKIP}"
+      else
+        echo "Not registered in $STATE_DIR: start and preflight are NOT using it."
+      fi
+      ;;
+
+    logs)
+      remote "$ip" "tail -${2:-40} '$REMOTE_DIR/logs/proxy.log'" || true
+      ;;
+
+    *) echo "usage: qwen_cluster.sh proxy {start|stop|status|logs}" >&2; return 2 ;;
+  esac
+}
+
 cmd_stop() {
   echo "Stopping servers ..."
   fanout stop "
@@ -762,6 +879,7 @@ case "${1:-}" in
   diag)   shift; cmd_diag "$@" ;;
   cleanup) shift; cmd_cleanup "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
+  proxy)  shift; cmd_proxy "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \
