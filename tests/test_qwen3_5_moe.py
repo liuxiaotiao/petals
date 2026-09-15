@@ -1,32 +1,27 @@
 """Small deterministic models; no pretrained weights or public swarm required."""
 import json
 from contextlib import contextmanager
-from unittest.mock import patch
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
-
 import pytest
 import torch
 from torch import nn
 from transformers import AutoConfig
 
 from petals import AutoDistributedConfig, AutoDistributedModelForCausalLM
+from petals.client.ptune import force_non_empty_weights
+from petals.data_structures import InferenceMetadata
 from petals.models.qwen3_5_moe.block import WrappedQwen3_5MoeBlock, cache_specs
-from petals.models.qwen3_5_moe.config import (
-    DHT_PREFIX_SUFFIX,
-    DistributedQwen3_5MoeConfig,
-    default_dht_prefix,
-)
+from petals.models.qwen3_5_moe.config import DHT_PREFIX_SUFFIX, DistributedQwen3_5MoeConfig, default_dht_prefix
 from petals.models.qwen3_5_moe.model import DistributedQwen3_5MoeForCausalLM
 from petals.models.qwen3_5_moe.ops import Qwen3_5MoeRMSNorm
 from petals.server.backend import TransformerBackend
 from petals.server.block_utils import get_distinct_block_indices, get_model_block
 from petals.utils.convert_block import QuantType, convert_block
-from petals.data_structures import InferenceMetadata
 from petals.utils.misc import DUMMY
-from petals.client.ptune import force_non_empty_weights
 
 
 def tiny_config(**kwargs):

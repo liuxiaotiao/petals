@@ -41,7 +41,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .[dev]
+          # hivemind is pinned to a 2023 commit whose setup.py imports pkg_resources, and
+          # setuptools stopped shipping that module in 81. Build isolation installs the
+          # newest setuptools into a throwaway environment, so the build fails before any
+          # code in this repo is imported. Build against a pinned setuptools instead of
+          # moving the hivemind commit, which would change what the servers actually run.
+          pip install "setuptools<81" wheel "grpcio-tools==1.60.0"
+          pip install --no-build-isolation .[dev]
       - name: Test
         run: |
           set -x  # Print executed commands

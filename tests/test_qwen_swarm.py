@@ -9,12 +9,12 @@ import time
 import pytest
 import torch
 from safetensors.torch import save_file
+from test_qwen3_5_moe import random_block, tiny_config
 
 from petals import AutoDistributedModelForCausalLM
 from petals.models.qwen3_5_moe.ops import Qwen3_5MoeRMSNorm
 from petals.server.server import Server
 from petals.utils.convert_block import QuantType
-from test_qwen3_5_moe import random_block, tiny_config
 
 
 @pytest.mark.skipif(os.getenv("PETALS_TEST_LOCAL_SWARM") != "1", reason="opt-in loopback swarm test")
@@ -100,8 +100,7 @@ def test_private_qwen_swarm(tmp_path, ranges, inference_only, automatic):
                 time.sleep(0.1)
         if automatic:
             from petals.data_structures import ServerState
-            from petals.utils.dht import compute_spans
-            from petals.utils.dht import get_remote_module_infos
+            from petals.utils.dht import compute_spans, get_remote_module_infos
 
             uids = [f"tiny-qwen.{i}" for i in range(c.num_hidden_layers)]
             infos = get_remote_module_infos(servers[0].dht, uids, latest=True)

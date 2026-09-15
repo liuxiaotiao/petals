@@ -138,7 +138,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.info(
         "CONNECT proxy on %s:%d, %s, ports %s",
-        args.host, args.port,
+        args.host,
+        args.port,
         "%d allowed client(s)" % len(ALLOWED_CLIENTS) if ALLOWED_CLIENTS else "ANY client",
         sorted(ALLOWED_PORTS),
     )

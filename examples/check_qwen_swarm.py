@@ -29,9 +29,7 @@ def summarize(dht, dht_prefix, num_blocks):
     online = [sum(server.state == ServerState.ONLINE for server in info.servers.values()) for info in infos]
     ready = compute_spans(infos, min_state=ServerState.ONLINE)
     joining = {
-        peer: span
-        for peer, span in compute_spans(infos, min_state=ServerState.JOINING).items()
-        if peer not in ready
+        peer: span for peer, span in compute_spans(infos, min_state=ServerState.JOINING).items() if peer not in ready
     }
     return online, ready, joining
 
@@ -68,9 +66,7 @@ def main():
     if args.dht_prefix and args.num_blocks:
         dht_prefix, num_blocks = args.dht_prefix, args.num_blocks
     else:
-        config = AutoDistributedConfig.from_pretrained(
-            args.model, revision=args.revision, dht_prefix=args.dht_prefix
-        )
+        config = AutoDistributedConfig.from_pretrained(args.model, revision=args.revision, dht_prefix=args.dht_prefix)
         dht_prefix, num_blocks = config.dht_prefix, config.num_hidden_layers
 
     dht = DHT(initial_peers=args.initial_peers, client_mode=True, start=True)

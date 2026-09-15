@@ -26,8 +26,20 @@ HEADROOM_GIB = 1.5
 # Worst case over every contiguous window, from the model's real 26-shard index.
 # Servers download whole shard files, so this is what the Hub cache must hold.
 WORST_CASE_DISK_GB = {
-    1: 6.1, 2: 10.1, 3: 10.1, 4: 12.0, 5: 15.2, 6: 15.4, 7: 16.8,
-    8: 20.4, 9: 21.2, 10: 21.9, 11: 25.5, 12: 26.3, 13: 26.9, 14: 30.5,
+    1: 6.1,
+    2: 10.1,
+    3: 10.1,
+    4: 12.0,
+    5: 15.2,
+    6: 15.4,
+    7: 16.8,
+    8: 20.4,
+    9: 21.2,
+    10: 21.9,
+    11: 25.5,
+    12: 26.3,
+    13: 26.9,
+    14: 30.5,
 }
 DISK_MARGIN_GB = 5.0  # leave room for logs, the venv and the OS
 
@@ -58,8 +70,12 @@ def main():
     parser.add_argument("--hosts-file", default="task/hosts.txt")
     parser.add_argument("--max-disk-gb", type=float, default=30.0, help="matches MAX_DISK_SPACE")
     parser.add_argument("--num-layers", type=int, default=40)
-    parser.add_argument("--cap", type=int, default=None,
-                        help="ceiling per host; sizing to the last layer that fits leaves no\nroom for activation peaks, and fewer layers per host also means less to download")
+    parser.add_argument(
+        "--cap",
+        type=int,
+        default=None,
+        help="ceiling per host; sizing to the last layer that fits leaves no\nroom for activation peaks, and fewer layers per host also means less to download",
+    )
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()
 
@@ -90,8 +106,11 @@ def main():
         note = "  <- cannot serve anything" if n == 0 else ""
         print(f"{node:5s} {n:>6d} {by_vram:>8d} {by_disk:>8d}   {who}{note}")
         total += n
-    print(f"\ntotal layer slots: {total} for {args.num_layers} layers "
-          f"({total / args.num_layers:.1f}x coverage)" if total else "")
+    print(
+        f"\ntotal layer slots: {total} for {args.num_layers} layers " f"({total / args.num_layers:.1f}x coverage)"
+        if total
+        else ""
+    )
     if total < args.num_layers:
         print(f"NOT ENOUGH: {args.num_layers - total} layer slots short. Free GPU memory or add hosts.")
     if unknown:
@@ -108,9 +127,9 @@ def main():
         fields = body.split()
         node, addr = fields[0], fields[1]
         n = limits.get(node, (None,))[0]
-        if n is None:                       # keep whatever was there
+        if n is None:  # keep whatever was there
             out.append(line)
-        elif n == 0:                        # cannot serve: comment it out rather than drop it
+        elif n == 0:  # cannot serve: comment it out rather than drop it
             out.append(f"# {node}  {addr}   blocks=0  # SKIPPED (no free VRAM) {comment}".rstrip())
         else:
             out.append(f"{node}  {addr}   blocks={n}  #{comment}".rstrip())
