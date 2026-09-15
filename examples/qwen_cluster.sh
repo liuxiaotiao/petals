@@ -533,15 +533,12 @@ nohup venv/bin/python -m petals.cli.run_dht \
   > logs/dht.log 2>&1 &
 echo \$! > run/dht.pid
 "
-  # The identity file keeps this address stable across restarts, so one read is enough.
-  local peer="" waited=0
-  while (( waited < 60 )); do
-    peer=$(remote "$bip" "grep -ao '/ip4/${bip//./\\.}/tcp/$DHT_PORT/p2p/[A-Za-z0-9]*' '$REMOTE_DIR/logs/dht.log' | head -1" || true)
-    [[ -n "$peer" ]] && break
-    sleep 2; waited=$((waited + 2))
-  done
-  [[ -n "$peer" ]] || { echo "Could not read the bootstrap address from $BOOTSTRAP_NODE:$REMOTE_DIR/logs/dht.log" >&2; exit 1; }
-  mkdir -p "$STATE_DIR"; printf '%s\n' "$peer" > "$PEER_FILE"
+  # Read it from the log rather than the cache: this DHT may have just been started.
+  local peer
+  peer=$(read_bootstrap_peer --fresh 60) || {
+    echo "Could not read the bootstrap address from $BOOTSTRAP_NODE:$REMOTE_DIR/logs/dht.log" >&2
+    exit 1
+  }
   echo "Bootstrap peer: $peer"
 
   # Pass through only the knobs that are set, so run_qwen_server.sh keeps its own defaults.
@@ -637,8 +634,12 @@ human_bytes() {
 }
 
 cmd_status() {
-  local peer; peer=$(cat "$PEER_FILE" 2>/dev/null || true)
-  [[ -n "$peer" ]] || { echo "No bootstrap address recorded; run 'start' first." >&2; exit 1; }
+  local peer
+  peer=$(read_bootstrap_peer) || {
+    echo "No bootstrap address cached, and $BOOTSTRAP_NODE's logs/dht.log has none either." >&2
+    echo "Either the swarm was never started, or the DHT log was cleared. Run 'start'." >&2
+    exit 1
+  }
   local watch=0
   [[ "${1:-}" == "--watch" ]] && watch=1
   local b; b=$(index_of "$BOOTSTRAP_NODE")
@@ -830,6 +831,33 @@ proxy_env_for() {
   local direct; direct="localhost,127.0.0.1,$(IFS=,; echo "${IPS[*]}")"
   printf "HTTPS_PROXY='%s' https_proxy='%s' NO_PROXY='%s' no_proxy='%s' " \
     "$addr" "$addr" "$direct" "$direct"
+}
+
+# Recover the bootstrap address. --identity_path pins it, so it survives restarts and can
+# always be re-read from the bootstrap node's own log; losing the cached copy (a fresh clone
+# of this repo, say) must not look like "there is no swarm".
+#   read_bootstrap_peer [--fresh] [wait_seconds]
+read_bootstrap_peer() {
+  local fresh=0
+  [[ "${1:-}" == --fresh ]] && { fresh=1; shift; }
+  local limit="${1:-0}" peer="" waited=0
+  if (( ! fresh )); then
+    peer=$(cat "$PEER_FILE" 2>/dev/null || true)
+    if [[ -n "$peer" ]]; then printf '%s\n' "$peer"; return 0; fi
+  fi
+  local b; b=$(index_of "$BOOTSTRAP_NODE")
+  local bip="${IPS[$b]}"
+  while :; do
+    peer=$(remote "$bip" \
+      "grep -ao '/ip4/${bip//./\\.}/tcp/$DHT_PORT/p2p/[A-Za-z0-9]*' '$REMOTE_DIR/logs/dht.log' 2>/dev/null | head -1" \
+      2>/dev/null || true)
+    [[ -n "$peer" ]] && break
+    (( waited >= limit )) && break
+    sleep 2; waited=$((waited + 2))
+  done
+  [[ -n "$peer" ]] || return 1
+  mkdir -p "$STATE_DIR"; printf '%s\n' "$peer" > "$PEER_FILE"
+  printf '%s\n' "$peer"
 }
 
 cmd_proxy() {
