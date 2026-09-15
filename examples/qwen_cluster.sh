@@ -2,6 +2,7 @@
 # Drive the whole private Qwen swarm over SSH from one control node.
 #
 #   examples/qwen_cluster.sh preflight # check every host can be deployed to, change nothing
+#   examples/qwen_cluster.sh synctime  # show clock skew; --yes steps clocks to the bootstrap
 #   examples/qwen_cluster.sh plan      # size each host's blocks= from its free VRAM/disk
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
@@ -100,6 +101,74 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
   return $rc
 }
 
+# Fill SKEWS[] with each host's clock offset from the bootstrap node, in seconds.
+# One host at a time, taking the midpoint of the round trip so SSH latency cancels out.
+# hivemind compares peers to EACH OTHER, so the bootstrap node is the reference; this
+# control node's own clock is irrelevant.
+SKEWS=()
+measure_skew() {
+  local i raw=()
+  for i in "${!IDS[@]}"; do
+    local t0 t1 epoch
+    t0=$(date +%s.%N)
+    epoch=$(remote "${IPS[$i]}" "date +%s.%N" 2>/dev/null || echo "")
+    t1=$(date +%s.%N)
+    if [[ -z "$epoch" ]]; then
+      raw+=("nan")
+    else
+      raw+=("$(awk -v r="$epoch" -v a="$t0" -v b="$t1" 'BEGIN {printf "%.1f", r - (a + b) / 2}')")
+    fi
+  done
+  local bi; bi=$(index_of "$BOOTSTRAP_NODE")
+  local base="${raw[$bi]}"
+  SKEWS=()
+  for i in "${!IDS[@]}"; do
+    if [[ "${raw[$i]}" == nan || "$base" == nan ]]; then
+      SKEWS+=("?")
+    else
+      SKEWS+=("$(awk -v x="${raw[$i]}" -v y="$base" 'BEGIN {printf "%+.1f", x - y}')")
+    fi
+  done
+}
+
+# Step every host's clock to the bootstrap node's. A stopgap for clusters whose egress
+# blocks public NTP: it aligns peers with each other, which is all hivemind checks, but
+# nothing keeps them aligned afterwards.
+cmd_synctime() {
+  local confirm=0
+  [[ "${1:-}" == --yes ]] && confirm=1
+
+  measure_skew
+  local i bi; bi=$(index_of "$BOOTSTRAP_NODE")
+  printf '%-5s %-16s %s\n' NODE ADDRESS "skew vs $BOOTSTRAP_NODE"
+  for i in "${!IDS[@]}"; do
+    printf '%-5s %-16s %ss\n' "${IDS[$i]}" "${IPS[$i]}" "${SKEWS[$i]}"
+  done
+
+  if (( ! confirm )); then
+    echo
+    echo "Dry run. 'synctime --yes' steps each host's clock to $BOOTSTRAP_NODE's."
+    echo "Needs passwordless sudo. Fix the NTP source too -- this does not stop the drift."
+    return 0
+  fi
+
+  echo
+  echo "Stepping clocks to $BOOTSTRAP_NODE ..."
+  for i in "${!IDS[@]}"; do
+    [[ "$i" == "$bi" ]] && continue
+    # Re-read the reference per host: the loop itself takes time.
+    local ref; ref=$(remote "${IPS[$bi]}" "date +%s.%N" 2>/dev/null || echo "")
+    if [[ -z "$ref" ]]; then echo "  ${IDS[$i]} SKIPPED (bootstrap unreachable)"; continue; fi
+    printf '  %-5s %s\n' "${IDS[$i]}" \
+      "$(remote "${IPS[$i]}" "sudo -n date -s @$ref >/dev/null 2>&1 && echo stepped || echo 'FAILED (passwordless sudo?)'" 2>/dev/null || echo unreachable)"
+  done
+
+  echo
+  echo "After:"
+  measure_skew
+  for i in "${!IDS[@]}"; do printf '  %-5s %ss\n' "${IDS[$i]}" "${SKEWS[$i]}"; done
+}
+
 # Everything deploy needs but does not install. Read-only: touches nothing on the hosts.
 cmd_preflight() {
   local interp="${NODE_PY:-$PY}"
@@ -150,31 +219,8 @@ print("hub=%s cdn=%s xet=%s vram_free=%s" % (
 PROBE
 )
 
-  # Clock skew, one host at a time so SSH latency does not pollute the reading.
-  # hivemind compares peers to EACH OTHER (MAX_DHT_TIME_DISCREPANCY_SECONDS = 3s), so the
-  # bootstrap node is the reference; this control node's own clock is irrelevant.
-  local i raw=()
-  for i in "${!IDS[@]}"; do
-    local t0 t1 epoch
-    t0=$(date +%s.%N)
-    epoch=$(remote "${IPS[$i]}" "date +%s.%N" 2>/dev/null || echo "")
-    t1=$(date +%s.%N)
-    if [[ -z "$epoch" ]]; then
-      raw+=("nan")
-    else
-      raw+=("$(awk -v r="$epoch" -v a="$t0" -v b="$t1" 'BEGIN {printf "%.1f", r - (a + b) / 2}')")
-    fi
-  done
-  local bi; bi=$(index_of "$BOOTSTRAP_NODE")
-  local base="${raw[$bi]}"
-  local skews=()
-  for i in "${!IDS[@]}"; do
-    if [[ "${raw[$i]}" == nan || "$base" == nan ]]; then
-      skews+=("?")
-    else
-      skews+=("$(awk -v x="${raw[$i]}" -v y="$base" 'BEGIN {printf "%+.1f", x - y}')")
-    fi
-  done
+  measure_skew
+  local skews=("${SKEWS[@]}")
 
   fanout preflight "
 py=\$('$interp' -c 'import sys; print(\"%d.%d.%d\" % sys.version_info[:3])' 2>/dev/null) || py=MISSING
@@ -541,6 +587,7 @@ if [ -f run/dht.pid ]; then kill \$(cat run/dht.pid) 2>/dev/null || true; rm -f 
 
 case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
+  synctime) shift; cmd_synctime "$@" ;;
   plan)   shift; python3 examples/plan_blocks.py --state-dir "$STATE_DIR" \
             --hosts-file "$HOSTS_FILE" "$@" ;;
   deploy) shift; cmd_deploy "$@" ;;
@@ -553,5 +600,5 @@ case "${1:-}" in
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \
               "${NBLOCKS[$i]:-(NUM_BLOCKS)}"; done ;;
-  *) sed -n '2,18p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,20p' "$0" >&2; exit 2 ;;
 esac
