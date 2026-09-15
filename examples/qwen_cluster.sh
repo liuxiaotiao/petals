@@ -2,7 +2,8 @@
 # Drive the whole private Qwen swarm over SSH from one control node.
 #
 #   examples/qwen_cluster.sh preflight # check every host can be deployed to, change nothing
-#   examples/qwen_cluster.sh synctime  # show clock skew; --yes steps clocks to the bootstrap
+#   examples/qwen_cluster.sh synctime  # clock skew, read from each host's NTP daemon where
+#                                     # there is one; --yes steps unsynced clocks to the bootstrap
 #   examples/qwen_cluster.sh plan      # size each host's blocks= from its free VRAM/disk
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
@@ -101,32 +102,59 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
   return $rc
 }
 
-# Fill SKEWS[] with each host's clock offset from the bootstrap node, in seconds.
-# One host at a time, taking the midpoint of the round trip so SSH latency cancels out.
-# hivemind compares peers to EACH OTHER, so the bootstrap node is the reference; this
-# control node's own clock is irrelevant.
+# Fill SKEWS[] with each host's clock offset from the bootstrap node in seconds,
+# SKEW_SRC[] with how it was measured, and SKEW_ERR[] with that measurement's error bar.
+#
+# Timing a round trip over SSH cannot resolve seconds. The midpoint estimate assumes the
+# path is symmetric, so a host whose session teardown runs a few seconds slower than its
+# setup reads as multi-second skew while its clock is in fact perfect -- an artifact that
+# once sent this cluster chasing a clock problem that did not exist. So when a host runs a
+# time daemon, ask the daemon for its offset from real NTP time instead: two hosts each
+# disciplined to true time agree with each other, which is all hivemind checks. The
+# round-trip estimate is the fallback for hosts with no daemon, and it is tagged with the
+# RTT that bounds its error so nobody reads it as precise.
 SKEWS=()
+SKEW_SRC=()
+SKEW_ERR=()
 measure_skew() {
-  local i raw=()
+  local i ntp=() rtt=() err=() src=()
   for i in "${!IDS[@]}"; do
-    local t0 t1 epoch
+    local t0 t1 out epoch offset
     t0=$(date +%s.%N)
-    epoch=$(remote "${IPS[$i]}" "date +%s.%N" 2>/dev/null || echo "")
+    # No $ or quotes in this command: it is passed through two shells before it runs.
+    out=$(remote "${IPS[$i]}" 'date +%s.%N; command -v chronyc >/dev/null 2>&1 && chronyc tracking 2>/dev/null | grep -E "^(Leap status|System time)"' 2>/dev/null || echo "")
     t1=$(date +%s.%N)
+    epoch=$(printf '%s\n' "$out" | head -1)
+    # "System time : 0.000000029 seconds slow of NTP time" -> the clock is that far behind
+    # true time. Only trusted while chrony reports a Normal leap status.
+    offset=$(printf '%s\n' "$out" | awk '
+      /^Leap status/ { leap = $4 }
+      /^System time/ { mag = $4; dir = $6 }
+      END { if (leap == "Normal" && mag != "") printf "%s%s", (dir == "fast" ? "+" : "-"), mag }')
     if [[ -z "$epoch" ]]; then
-      raw+=("nan")
-    else
-      raw+=("$(awk -v r="$epoch" -v a="$t0" -v b="$t1" 'BEGIN {printf "%.1f", r - (a + b) / 2}')")
+      ntp+=("nan"); rtt+=("nan"); err+=("nan"); src+=("unreachable")
+      continue
     fi
+    ntp+=("${offset:-nan}")
+    rtt+=("$(awk -v r="$epoch" -v a="$t0" -v b="$t1" 'BEGIN {printf "%.3f", r - (a + b) / 2}')")
+    err+=("$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.2f", (b - a) / 2}')")
+    if [[ -n "$offset" ]]; then src+=("ntp"); else src+=("rtt"); fi
   done
+
   local bi; bi=$(index_of "$BOOTSTRAP_NODE")
-  local base="${raw[$bi]}"
-  SKEWS=()
+  SKEWS=(); SKEW_SRC=(); SKEW_ERR=()
   for i in "${!IDS[@]}"; do
-    if [[ "${raw[$i]}" == nan || "$base" == nan ]]; then
-      SKEWS+=("?")
+    # Daemon offsets are in the true-time frame and round-trip estimates are in the control
+    # node's frame; the two cannot be subtracted from each other, so a pair falls back to
+    # the round-trip frame unless BOTH ends read their own daemon.
+    if [[ "${src[$i]}" == unreachable || "${src[$bi]}" == unreachable ]]; then
+      SKEWS+=("?"); SKEW_SRC+=("unreachable"); SKEW_ERR+=("0")
+    elif [[ "${src[$i]}" == ntp && "${src[$bi]}" == ntp ]]; then
+      SKEWS+=("$(awk -v x="${ntp[$i]}" -v y="${ntp[$bi]}" 'BEGIN {printf "%+.3f", x - y}')")
+      SKEW_SRC+=("ntp"); SKEW_ERR+=("0.05")
     else
-      SKEWS+=("$(awk -v x="${raw[$i]}" -v y="$base" 'BEGIN {printf "%+.1f", x - y}')")
+      SKEWS+=("$(awk -v x="${rtt[$i]}" -v y="${rtt[$bi]}" 'BEGIN {printf "%+.1f", x - y}')")
+      SKEW_SRC+=("rtt"); SKEW_ERR+=("$(awk -v x="${err[$i]}" -v y="${err[$bi]}" 'BEGIN {printf "%.2f", x + y}')")
     fi
   done
 }
@@ -135,15 +163,46 @@ measure_skew() {
 # blocks public NTP: it aligns peers with each other, which is all hivemind checks, but
 # nothing keeps them aligned afterwards.
 cmd_synctime() {
-  local confirm=0
-  [[ "${1:-}" == --yes ]] && confirm=1
+  local confirm=0 force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --yes) confirm=1 ;;
+      --force) force=1 ;;
+    esac
+  done
 
   measure_skew
   local i bi; bi=$(index_of "$BOOTSTRAP_NODE")
-  printf '%-5s %-16s %s\n' NODE ADDRESS "skew vs $BOOTSTRAP_NODE"
+  local synced=0 known=0
+  printf '%-5s %-16s %-12s %s\n' NODE ADDRESS "skew vs $BOOTSTRAP_NODE" measured-by
   for i in "${!IDS[@]}"; do
-    printf '%-5s %-16s %ss\n' "${IDS[$i]}" "${IPS[$i]}" "${SKEWS[$i]}"
+    local note="${SKEW_SRC[$i]}"
+    [[ "$note" == rtt ]] && note="rtt (+-${SKEW_ERR[$i]}s)"
+    [[ "$note" == ntp ]] && note="its own NTP daemon"
+    printf '%-5s %-16s %-12s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${SKEWS[$i]}s" "$note"
+    [[ "${SKEW_SRC[$i]}" == ntp ]] && synced=$((synced + 1))
+    [[ "${SKEW_SRC[$i]}" != unreachable ]] && known=$((known + 1))
   done
+
+  echo
+  if (( synced == known && known > 0 )); then
+    echo "Every host is disciplined by a running NTP daemon, so these offsets are read from"
+    echo "the daemons and are accurate to milliseconds. There is nothing to step."
+    if (( confirm && ! force )); then
+      echo
+      echo "Refusing --yes: stepping a clock out from under chrony makes things worse, not" >&2
+      echo "better -- chrony drags it back, and the cluster is genuinely skewed until it does." >&2
+      echo "Pass --force only if you have stopped the time daemons first." >&2
+      return 1
+    fi
+    (( confirm )) || return 0
+  elif (( synced )); then
+    echo "$synced of $known host(s) read their offset from a running NTP daemon (millisecond"
+    echo "accuracy); the rest are timed over SSH, where +-a second or two is measurement noise."
+  else
+    echo "No host runs a time daemon, so every number above is an SSH round-trip estimate."
+    echo "Its error bar is in the last column: treat anything inside it as noise, not skew."
+  fi
 
   if (( ! confirm )); then
     echo
@@ -220,7 +279,7 @@ PROBE
 )
 
   measure_skew
-  local skews=("${SKEWS[@]}")
+  local skews=("${SKEWS[@]}") skewsrc=("${SKEW_SRC[@]}") skewerr=("${SKEW_ERR[@]}")
 
   fanout preflight "
 py=\$('$interp' -c 'import sys; print(\"%d.%d.%d\" % sys.version_info[:3])' 2>/dev/null) || py=MISSING
@@ -257,24 +316,31 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     local line skew mark
     line=$(tail -1 "$STATE_DIR/out/${IDS[$i]}.preflight" 2>/dev/null)
     skew="${skews[$i]}"
-    # hivemind drops peers >3s apart. 2-3s still works but has no margin, so warn
-    # without failing the host on it.
-    if [[ "$skew" == "?" ]] || awk -v s="$skew" 'BEGIN {exit !(s < -3 || s > 3)}'; then
+    # hivemind drops peers >3s apart. 2-3s still works but has no margin, so warn without
+    # failing the host on it. Judge the SMALLEST skew the measurement is consistent with
+    # (|skew| minus its error bar): a round-trip estimate with seconds of slop cannot prove
+    # a clock is wrong, and blocking deploy on its noise is how a healthy cluster gets
+    # flagged. Only a daemon-read offset, whose error bar is milliseconds, can fail a host.
+    if [[ "$skew" == "?" ]]; then
       mark="CLOCK-SKEW"
-    elif awk -v s="$skew" 'BEGIN {exit !(s < -2 || s > 2)}'; then
+    elif awk -v s="$skew" -v e="${skewerr[$i]}" 'BEGIN {exit !((s < 0 ? -s : s) - e > 3)}'; then
+      mark="CLOCK-SKEW"
+    elif awk -v s="$skew" -v e="${skewerr[$i]}" 'BEGIN {exit !((s < 0 ? -s : s) - e > 2)}'; then
       mark="clock-marginal"
     else
       mark="ok"
     fi
-    printf '  %s clock=%ss-vs-%s/%s\n' \
-      "${line:-${IDS[$i]} no-response}" "$skew" "$BOOTSTRAP_NODE" "$mark"
+    printf '  %s clock=%ss-vs-%s(%s)/%s\n' \
+      "${line:-${IDS[$i]} no-response}" "$skew" "$BOOTSTRAP_NODE" "${skewsrc[$i]}" "$mark"
     [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" == CLOCK-SKEW ]] \
       && bad=$((bad + 1))
   done
   echo
   if (( bad )); then
     echo "$bad host(s) are not ready. Fix those before running deploy." >&2
-    echo "  CLOCK-SKEW  -> hivemind drops peers >3s apart; sync NTP (chrony / systemd-timesyncd)" >&2
+    echo "  CLOCK-SKEW  -> hivemind drops peers >3s apart; sync NTP (chrony / systemd-timesyncd)." >&2
+    echo "                 (rtt) means the offset was timed over SSH and is only good to a" >&2
+    echo "                 second or two; (ntp) means the host's own daemon reported it." >&2
     echo "  xet=UNREACHABLE -> export HF_HUB_DISABLE_XET=1 and re-run; that makes this check pass" >&2
     echo "  cdn=UNREACHABLE -> weights cannot be downloaded at all: allow *.cdn.hf.co and" >&2
     echo "                     cdn-lfs*.huggingface.co, set HF_ENDPOINT to a mirror, or" >&2
