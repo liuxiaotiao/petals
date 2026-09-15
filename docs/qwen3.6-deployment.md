@@ -116,14 +116,16 @@ Hivemind 的旧构建脚本使用 `pkg_resources`，因此这里固定 `setuptoo
 
 ## 从控制节点一键驱动（推荐）
 
-`task/hosts.txt` 里每行是 `<节点id> <IP>:<Petals端口>`，SSH 走另一个端口（`SSH_PORT`，默认 22）。
+`task/hosts.txt` 里每行是 `<节点id> <IP>:<Petals端口> [blocks=N]`，SSH 走另一个端口（`SSH_PORT`，默认 22）。
+`blocks=N` 覆盖该台的层数，这样 24GB 卡和 16GB 的 T4 能在同一个集群里各取所需——
+不写就用全局 `NUM_BLOCKS`，也不写就由各节点自己按显存算（对这个模型会算到 14 层并 OOM，别用）。
 `examples/qwen_cluster.sh` 用它把 15 台机器当一个集群管：
 
 ```bash
 export SSH_USER=ubuntu                 # 各节点的登录用户，需已配好免密公钥
 export MODEL_NAME=Qwen/Qwen3.6-35B-A3B
 export MAX_DISK_SPACE=30GB             # 每台的 Hub 分片缓存上限，见下文磁盘一节
-export NUM_BLOCKS=11                   # 24GB 卡；不设会自动选到 14 层并 OOM
+export HF_HUB_DISABLE_XET=1            # 出口不通 *.xethub.hf.co 时必需
 # 各节点已有的解释器（conda 环境等）。设了它就不再另装 torch。
 export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python
 

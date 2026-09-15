@@ -9,7 +9,9 @@
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
 #   examples/qwen_cluster.sh stop      # stop servers, then the DHT
 #
-# Hosts come from task/hosts.txt: "<id> <ip>:<petals_port>  # comment".
+# Hosts come from task/hosts.txt: "<id> <ip>:<petals_port> [blocks=N]  # comment".
+# blocks=N overrides NUM_BLOCKS for that one host, so a 16 GB card can serve fewer
+# layers than a 24 GB one in the same cluster.
 # SSH is a separate port (SSH_PORT, default 22).
 set -euo pipefail
 
@@ -45,12 +47,13 @@ READY_TIMEOUT="${READY_TIMEOUT:-3600}"           # Hub download of ~25 GB per ho
 STATE_DIR="${STATE_DIR:-$REPO_ROOT/.qwen-cluster}"
 PEER_FILE="$STATE_DIR/bootstrap_peer"
 
-IDS=() IPS=() PORTS=()
-while read -r id addr _rest; do
+IDS=() IPS=() PORTS=() NBLOCKS=()
+while read -r id addr extra _rest; do
   [[ -z "${id:-}" || "$id" == \#* ]] && continue
   IDS+=("$id")
   IPS+=("${addr%%:*}")
   PORTS+=("${addr##*:}")
+  if [[ "${extra:-}" == blocks=* ]]; then NBLOCKS+=("${extra#blocks=}"); else NBLOCKS+=(""); fi
 done < <(sed 's/#.*//' "$HOSTS_FILE")
 (( ${#IDS[@]} )) || { echo "No hosts parsed from $HOSTS_FILE" >&2; exit 2; }
 
@@ -72,6 +75,9 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
     local cmd="${template//\{ID\}/${IDS[$i]}}"
     cmd="${cmd//\{IP\}/${IPS[$i]}}"
     cmd="${cmd//\{PORT\}/${PORTS[$i]}}"
+    # Empty unless this host pinned its own layer count; placed last so it wins.
+    local nb=""; [[ -n "${NBLOCKS[$i]}" ]] && nb="NUM_BLOCKS='${NBLOCKS[$i]}' "
+    cmd="${cmd//\{NBLOCKS\}/$nb}"
     remote "${IPS[$i]}" "$cmd" > "$STATE_DIR/out/${IDS[$i]}.$label" 2>&1 &
     pids+=($!)
   done
@@ -280,7 +286,7 @@ cd '$REMOTE_DIR'
 if [ -f run/server.pid ] && kill -0 \$(cat run/server.pid) 2>/dev/null; then echo already-running; exit 0; fi
 cd repo
 BOOTSTRAP_PEER='$peer' ANNOUNCE_IP='{IP}' PORT='{PORT}' \
-MODEL_NAME='$MODEL_NAME' MAX_DISK_SPACE='$MAX_DISK_SPACE' $passthrough \
+MODEL_NAME='$MODEL_NAME' MAX_DISK_SPACE='$MAX_DISK_SPACE' $passthrough {NBLOCKS}\
 CACHE_DIR=\"\$HOME/$REMOTE_DIR/cache\" PYTHON=\"\$HOME/$REMOTE_DIR/venv/bin/python\" \
 nohup bash examples/run_qwen_server.sh > \"\$HOME/$REMOTE_DIR/logs/server.log\" 2>&1 &
 echo \$! > \"\$HOME/$REMOTE_DIR/run/server.pid\"
@@ -367,7 +373,8 @@ case "${1:-}" in
   diag)   shift; cmd_diag "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
-  hosts)  printf '%s %s %s\n' "${IDS[@]}" | : ; for i in "${!IDS[@]}"; do
-            printf '%-5s %-16s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}"; done ;;
+  hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
+            printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \
+              "${NBLOCKS[$i]:-(NUM_BLOCKS)}"; done ;;
   *) sed -n '2,14p' "$0" >&2; exit 2 ;;
 esac
