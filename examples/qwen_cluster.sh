@@ -397,9 +397,31 @@ echo \"{ID} \$alive cache=\${cache:-0} lines=\$lines | \${last:-no error lines}\
   for id in "${IDS[@]}"; do
     printf '  %s\n' "$(tail -1 "$STATE_DIR/out/$id.diag" 2>/dev/null || echo "$id no-response")"
   done
+  # Every server depends on the bootstrap DHT, so when nothing is online this is the
+  # first thing to rule out. diag used to only read server logs and miss it entirely.
+  local b; b=$(index_of "$BOOTSTRAP_NODE")
+  echo
+  echo "bootstrap DHT on $BOOTSTRAP_NODE (${IPS[$b]}:$DHT_PORT):"
+  remote "${IPS[$b]}" "
+cd '$REMOTE_DIR' 2>/dev/null || { echo '  no $REMOTE_DIR on this host'; exit 0; }
+if [ -f run/dht.pid ] && kill -0 \$(cat run/dht.pid) 2>/dev/null; then state=running; else state=DEAD; fi
+listening=no
+if command -v ss >/dev/null 2>&1; then
+  ss -ltn 2>/dev/null | grep -q ':$DHT_PORT ' && listening=yes
+elif command -v netstat >/dev/null 2>&1; then
+  netstat -ltn 2>/dev/null | grep -q ':$DHT_PORT ' && listening=yes
+else
+  listening=unknown
+fi
+echo \"  state=\$state  port_$DHT_PORT=\$listening\"
+echo '  --- last lines of logs/dht.log ---'
+tail -8 logs/dht.log 2>/dev/null | cut -c1-140 | sed 's/^/  /' || echo '  (no dht.log)'
+" 2>/dev/null || echo "  (host unreachable)"
+
   echo
   echo "cache= grows while weights download. DEAD with a traceback means it crashed;"
   echo "full log: bash examples/qwen_cluster.sh logs <node-id> 80"
+  echo "If the DHT above is DEAD, every server will fail the same way -- fix it first."
 }
 
 # List, and optionally kill, processes that would get in a fresh start's way.
