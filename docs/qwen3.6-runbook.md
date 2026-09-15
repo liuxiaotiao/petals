@@ -114,13 +114,18 @@ bash examples/qwen_cluster.sh start
 等 `status` 报 "Every layer is online" 之后:
 
 ```bash
-BOOTSTRAP_PEER=$(cat .qwen-cluster/bootstrap_peer)
-
-python examples/qwen_generate.py \
-  --initial-peers "$BOOTSTRAP_PEER" \
+bash examples/qwen_cluster.sh client \
   --prompt '请解释一下分布式推理的工作原理。' \
   --max-new-tokens 128
 ```
+
+**控制节点上没有装 petals,也不需要装。** `client` 在一个节点上跑生成——
+那里 venv、仓库、tokenizer 缓存都是现成的。默认用 `CLIENT_NODE`(默认等于
+`PROXY_NODE`,因为它一定能访问 Hub),`--node N03` 可以指定别的。
+`--initial-peers` 自动填,`--prompt` 之后的参数原样转给 `qwen_generate.py`。
+
+它默认带 `PETALS_MAX_RETRIES=3`。客户端原本的重试预算在这条路径上等价于**无限重试**,
+真出问题时你看到的是永远转圈而不是报错。
 
 服务端如果固定了 `MODEL_REVISION`,客户端要加同样的 `--revision`。
 两边都不指定前缀时,会从仓库名推出同一个 DHT 前缀
@@ -139,6 +144,7 @@ python examples/qwen_generate.py \
 | `deploy` | rsync 本仓库到各节点 `~/petals-qwen/repo`,基于 `NODE_PY` 建 venv。幂等 |
 | `proxy start\|stop\|status\|logs` | 在 `PROXY_NODE` 上起 CONNECT 代理,并让其余节点经它访问 HF |
 | `start [--restart]` | 起 bootstrap DHT,再起所有 GPU 服务端。默认跳过已在跑的;`--restart` 先停后起,**改环境变量的唯一办法** |
+| `client [--node N] [...]` | 在某个节点上跑生成,参数转给 `qwen_generate.py`。控制节点不需要装 petals |
 | `status [--watch]` | 每台的进程状态 + 缓存大小 + 下载速率,加上 DHT 里的层覆盖 |
 | `diag` | 没上线时用:进程死活、缓存大小、日志最后一条错误 + 该错误有多旧、bootstrap DHT 状态 |
 | `logs <节点> [行数]` | 看某一台的服务端日志 |

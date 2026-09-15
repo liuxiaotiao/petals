@@ -11,6 +11,7 @@
 #   examples/qwen_cluster.sh start --restart  # also restart servers already running,
 #                                     # the only way to change a running server's environment
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
+#   examples/qwen_cluster.sh client --prompt '...'   # generate, from a node that has Petals
 #   examples/qwen_cluster.sh diag      # why is nothing online: alive? downloading? crashed?
 #   examples/qwen_cluster.sh cleanup   # list stale/GPU-holding processes (kills nothing)
 #   examples/qwen_cluster.sh cleanup --ours --yes   # kill this deployment's leftovers
@@ -43,6 +44,7 @@ BOOTSTRAP_NODE="${BOOTSTRAP_NODE:-N01}"
 PROXY_NODE="${PROXY_NODE:-N08}"
 PROXY_PORT="${PROXY_PORT:-8899}"
 PROXY_SKIP="${PROXY_SKIP:-}"            # node ids with their own egress, space separated
+CLIENT_NODE="${CLIENT_NODE:-$PROXY_NODE}"  # the node the client runs on
 PROXY_ALLOW="${PROXY_ALLOW:-}"          # client IPs; empty means every host in HOSTS_FILE
 PROXY_PORTS="${PROXY_PORTS:-80,443}"    # destination ports the proxy will open
 DHT_PORT="${DHT_PORT:-31337}"
@@ -614,9 +616,26 @@ echo '{ID} cleared'
   local restart_step=""
   if (( restart )); then
     echo "--restart: stopping running servers first so they pick up this environment."
+    # A Petals server needs time to unregister its blocks and release the port. Starting
+    # the replacement a few seconds after SIGTERM leaves two processes on one address:
+    # the DHT then advertises the new peer id at a port the old process still answers,
+    # and every client that dials it fails with a peer id mismatch. So wait for the old
+    # one to actually be gone, and stop being polite about it if it will not go.
     restart_step="
-if [ -f run/server.pid ]; then kill \$(cat run/server.pid) 2>/dev/null || true; rm -f run/server.pid; fi
-sleep 3"
+venv_python=\"\$HOME/$REMOTE_DIR/venv/bin/python\"
+if [ -f run/server.pid ]; then kill \$(cat run/server.pid) 2>/dev/null || true; fi
+waited=0
+while [ \$waited -lt 60 ]; do
+  alive=\$(pgrep -f \"\$venv_python -m petals\\.cli\\.run_server\" 2>/dev/null | grep -vx \"\$\$\" | head -1)
+  [ -z \"\$alive\" ] && break
+  sleep 2; waited=\$(( waited + 2 ))
+done
+for pid in \$(pgrep -f \"\$venv_python -m petals\\.cli\\.run_server\" 2>/dev/null); do
+  [ \"\$pid\" = \"\$\$\" ] && continue
+  kill -9 \"\$pid\" 2>/dev/null || true
+done
+rm -f run/server.pid
+sleep 2"
   fi
 
   echo "Starting ${#IDS[@]} servers ..."
@@ -994,6 +1013,37 @@ fi
   esac
 }
 
+# Run the client from a node, because the control node has no Petals install and does not
+# need one: every deployed host already has the venv, the repo and a warm tokenizer cache.
+# CLIENT_NODE defaults to the proxy node, which by definition can reach the Hub.
+cmd_client() {
+  local node="$CLIENT_NODE"
+  if [[ "${1:-}" == --node ]]; then node="$2"; shift 2; fi
+  local i; i=$(index_of "$node")
+  local peer
+  peer=$(read_bootstrap_peer) || {
+    echo "No bootstrap address; is the swarm running?" >&2; exit 1
+  }
+
+  # Anything after the subcommand goes to qwen_generate.py untouched, so its own flags
+  # (--prompt, --max-new-tokens, --revision, --dht-prefix) work without being mirrored here.
+  local args=""
+  local a
+  for a in "$@"; do args+=" '${a//\'/\'\\\'\'}'"; done
+
+  echo "Running the client on $node (${IPS[$i]}) ..."
+  # PETALS_MAX_RETRIES: the client's default retry budget behaves as unlimited on this
+  # path, so a real failure shows up as an endless wait instead of a traceback.
+  remote "${IPS[$i]}" "
+cd '$REMOTE_DIR/repo'
+HF_HUB_DISABLE_XET='${HF_HUB_DISABLE_XET:-1}' \
+PETALS_MAX_RETRIES='${PETALS_MAX_RETRIES:-3}' \
+$(proxy_env_for "$node")\
+"\$HOME/$REMOTE_DIR/venv/bin/python" examples/qwen_generate.py \
+  --initial-peers '$peer' --model '$MODEL_NAME'${MODEL_REVISION:+ --revision '$MODEL_REVISION'}$args
+"
+}
+
 cmd_stop() {
   local with_dht=0
   [[ "${1:-}" == --dht || "${1:-}" == --all ]] && with_dht=1
@@ -1035,6 +1085,7 @@ case "${1:-}" in
   cleanup) shift; cmd_cleanup "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
   proxy)  shift; cmd_proxy "$@" ;;
+  client) shift; cmd_client "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \
