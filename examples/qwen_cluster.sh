@@ -263,14 +263,17 @@ def probe_weights(endpoint, model):
     that distinguishes the two, and it follows whatever endpoint is really in effect instead
     of a hardcoded CDN hostname that a mirror would never use.
     """
-    base = "%s/%s/resolve/main" % (endpoint, model)
+    revision = os.environ.get("QWEN_REVISION") or "main"
+    base = "%s/%s/resolve/%s" % (endpoint, model, revision)
     try:
         request = urllib.request.Request(base + "/model.safetensors.index.json")
         index = json.loads(urllib.request.urlopen(request, timeout=20).read().decode())
         shard = sorted(set(index["weight_map"].values()))[0]
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as error:
         # An HTTP status means a server answered: the repo is missing, gated or misnamed.
-        return "NO-INDEX"
+        # Which one is the difference between "use another mirror" and "set HF_TOKEN",
+        # so carry the code instead of collapsing both into one word.
+        return "NO-INDEX-%d" % error.code
     except Exception:
         # Anything else never reached one, which is a network problem, not a repo problem.
         return "UNREACHABLE"
@@ -337,11 +340,13 @@ timeout 25 '$interp' -m pip download --no-deps -d /tmp/.qwen-pipcheck packaging 
   && pypi=ok || pypi=UNREACHABLE
 rm -rf /tmp/.qwen-pipcheck
 net=\$(echo '$probe_b64' | base64 -d > /tmp/.qwen_probe.py && \
-  QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' HF_ENDPOINT='${HF_ENDPOINT:-}' QWEN_MODEL='$MODEL_NAME' timeout 75 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
+  QWEN_SKIP_XET='${HF_HUB_DISABLE_XET:-}' HF_ENDPOINT='${HF_ENDPOINT:-}' QWEN_MODEL='$MODEL_NAME' QWEN_REVISION='${MODEL_REVISION:-}' timeout 75 '$interp' /tmp/.qwen_probe.py 2>/dev/null)
 rm -f /tmp/.qwen_probe.py
 disk=\$(df -Pk \"\$HOME\" | awk 'NR==2 {printf \"%.0fG\", \$4/1048576}')
 echo \"{ID} python=\$py torch=\$torch gpu=\$gpu venv=\$venv git=\$git rsync=\$rsync github=\$github pypi=\$pypi \${net:-hub=? xet=? vram_free=?} disk_free=\$disk\"
-case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*) exit 1 ;; esac
+case \"\$torch\$venv\$git\$rsync\$github\$pypi\" in *MISSING*|*UNREACHABLE*) exit 1 ;; esac
+case \"\$net\" in *hub=ok*) ;; *) exit 1 ;; esac
+case \"\$net\" in *cdn=ok*) ;; *) exit 1 ;; esac
 " || true
 
   echo
@@ -366,7 +371,10 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     fi
     printf '  %s clock=%ss-vs-%s(%s)/%s\n' \
       "${line:-${IDS[$i]} no-response}" "$skew" "$BOOTSTRAP_NODE" "${skewsrc[$i]}" "$mark"
-    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" == CLOCK-SKEW ]] \
+    # Require hub=ok and cdn=ok by name: a host that cannot read the index or pull a
+    # weight byte is not ready, whatever new word the probe invents to say so.
+    [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" == CLOCK-SKEW \
+       || "$line" != *hub=ok* || "$line" != *cdn=ok* ]] \
       && bad=$((bad + 1))
   done
   echo
@@ -379,8 +387,8 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     echo "  cdn=UNREACHABLE -> the API answered but real weight bytes did not arrive: allow" >&2
     echo "                     *.cdn.hf.co and cdn-lfs*.huggingface.co, set HF_ENDPOINT to a" >&2
     echo "                     mirror, or pre-seed the cache from a host whose egress works" >&2
-    echo "  cdn=NO-INDEX    -> the repo index itself would not load: wrong MODEL_NAME, a gated" >&2
-    echo "                     repo needing HF_TOKEN, or a mirror that does not carry it" >&2
+    echo "  cdn=NO-INDEX-404 -> that endpoint does not carry $MODEL_NAME; try another mirror" >&2
+    echo "  cdn=NO-INDEX-401/403 -> the repo is gated: accept its terms and set HF_TOKEN" >&2
     echo "  vram_free=ERR-* -> CUDA context could not be created; the GPU is full or wedged" >&2
     echo "  (clock-marginal is a warning only and does not block deploy)" >&2
     return 1
