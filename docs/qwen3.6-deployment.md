@@ -112,6 +112,7 @@ bash examples/qwen_cluster.sh preflight # 只读检查 15 台是否具备部署�
 bash examples/qwen_cluster.sh deploy   # rsync 本仓库到 15 台，各自建 venv 装依赖
 bash examples/qwen_cluster.sh start    # 起 DHT，抓引导地址，再并发起 15 个服务端
 bash examples/qwen_cluster.sh status --watch   # 轮询到 40 层全覆盖为止
+bash examples/qwen_cluster.sh diag             # 没有服务端上线时先跑这个
 bash examples/qwen_cluster.sh logs N07 100     # 看某台的日志
 bash examples/qwen_cluster.sh stop             # 停服务端，再停 DHT
 ```
@@ -169,6 +170,26 @@ GPU 不可见的节点显示 `NO-CUDA`——这一步同时充当上真机前的
 ```
 
 任何一项是 `MISSING` / `UNREACHABLE` 就返回非零并指出有几台不合格，先修好再 `deploy`。
+
+### 一个服务端都没上线时
+
+`check_qwen_swarm.py` 会把 ONLINE 和 JOINING 分开报。服务端在**加载权重完成之前**
+一直是 JOINING，35B 走 Hub 要很久，所以 `0 server(s) online, 12 still joining` 是正常的等待中状态。
+`0 online, 0 joining` 才是出了问题。
+
+```bash
+bash examples/qwen_cluster.sh diag
+```
+
+```
+  N01 running cache=18G lines=214 | no error lines          ← 正常，正在下载
+  N02 DEAD cache=4.0K lines=31 | RuntimeError: CUDA error: no kernel image is available
+  N03 NO-LOG cache=0 | server was never started on this host
+```
+
+按 `cache=` 是否在增长判断下载进度。若全部 `running`、无报错、但 `cache` 不涨，
+多半是节点连不上 Hub，或者公告进不了 DHT——检查各网段到引导节点 `31337` 端口的连通性，
+以及每台的 `ANNOUNCE_IP` 是否是别的网段能拨通的地址。
 
 控制节点需要 `rsync` 和到各节点的免密 SSH；不需要装 Petals（覆盖检查是在 N01 上远程跑的）。
 

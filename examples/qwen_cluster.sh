@@ -5,6 +5,7 @@
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
+#   examples/qwen_cluster.sh diag      # why is nothing online: alive? downloading? crashed?
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
 #   examples/qwen_cluster.sh stop      # stop servers, then the DHT
 #
@@ -248,6 +249,31 @@ cmd_status() {
     examples/check_qwen_swarm.py --initial-peers '$peer' --model '$MODEL_NAME' $extra"
 }
 
+# One line per host answering "is it alive, is it downloading, what broke".
+cmd_diag() {
+  echo "host  state  cache  log  | last error"
+  fanout diag "
+log=\"\$HOME/$REMOTE_DIR/logs/server.log\"
+if [ -f \"\$HOME/$REMOTE_DIR/run/server.pid\" ] && kill -0 \$(cat \"\$HOME/$REMOTE_DIR/run/server.pid\") 2>/dev/null
+then alive=running; else alive=DEAD; fi
+cache=\$(du -sh \"\$HOME/$REMOTE_DIR/cache\" 2>/dev/null | cut -f1)
+if [ ! -f \"\$log\" ]; then
+  echo \"{ID} NO-LOG cache=\${cache:-0} | server was never started on this host\"
+  exit 0
+fi
+lines=\$(wc -l < \"\$log\")
+last=\$(grep -aiE 'error|exception|traceback|assert|killed|no kernel image|out of memory' \"\$log\" | tail -1 | cut -c1-140)
+echo \"{ID} \$alive cache=\${cache:-0} lines=\$lines | \${last:-no error lines}\"
+" || true
+  local id
+  for id in "${IDS[@]}"; do
+    printf '  %s\n' "$(tail -1 "$STATE_DIR/out/$id.diag" 2>/dev/null || echo "$id no-response")"
+  done
+  echo
+  echo "cache= grows while weights download. DEAD with a traceback means it crashed;"
+  echo "full log: bash examples/qwen_cluster.sh logs <node-id> 80"
+}
+
 cmd_logs() {
   local id="${1:?usage: logs <node-id> [lines]}" lines="${2:-60}"
   local i; i=$(index_of "$id")
@@ -275,9 +301,10 @@ case "${1:-}" in
   deploy) shift; cmd_deploy "$@" ;;
   start)  shift; cmd_start "$@" ;;
   status) shift; cmd_status "$@" ;;
+  diag)   shift; cmd_diag "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%s %s %s\n' "${IDS[@]}" | : ; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}"; done ;;
-  *) sed -n '2,13p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,14p' "$0" >&2; exit 2 ;;
 esac

@@ -18,11 +18,22 @@ from petals.utils.dht import compute_spans, get_remote_module_infos
 
 
 def summarize(dht, dht_prefix, num_blocks):
-    """Return (per-layer online server counts, spans keyed by peer)."""
+    """Return (per-layer ONLINE counts, ONLINE spans, JOINING spans).
+
+    A server announces JOINING before it has finished loading weights, which for a
+    35B model over the Hub can take a long time. Reporting those separately is the
+    difference between "still downloading" and "every server died on startup".
+    """
     uids = [f"{dht_prefix}{UID_DELIMITER}{index}" for index in range(num_blocks)]
     infos = get_remote_module_infos(dht, uids, latest=True)
     online = [sum(server.state == ServerState.ONLINE for server in info.servers.values()) for info in infos]
-    return online, compute_spans(infos, min_state=ServerState.ONLINE)
+    ready = compute_spans(infos, min_state=ServerState.ONLINE)
+    joining = {
+        peer: span
+        for peer, span in compute_spans(infos, min_state=ServerState.JOINING).items()
+        if peer not in ready
+    }
+    return online, ready, joining
 
 
 def format_ranges(indices):
@@ -66,10 +77,13 @@ def main():
     try:
         deadline = time.monotonic() + args.timeout
         while True:
-            online, spans = summarize(dht, dht_prefix, num_blocks)
+            online, spans, joining = summarize(dht, dht_prefix, num_blocks)
             missing = [index for index, count in enumerate(online) if count == 0]
 
-            print(f"\nDHT prefix {dht_prefix}, {num_blocks} layers, {len(spans)} server(s) online")
+            print(
+                f"\nDHT prefix {dht_prefix}, {num_blocks} layers, "
+                f"{len(spans)} server(s) online, {len(joining)} still joining"
+            )
             for peer_id, span in sorted(spans.items(), key=lambda item: item[1].start):
                 info = span.server_info
                 rps = f"{info.inference_rps:.1f}" if info.inference_rps else "n/a"
@@ -78,11 +92,19 @@ def main():
                     f"  {info.torch_dtype}/{info.quant_type}"
                     f"  inference_rps={rps}  cache_tokens_left={info.cache_tokens_left}"
                 )
+            for peer_id, span in sorted(joining.items(), key=lambda item: item[1].start):
+                print(f"  …{str(peer_id)[-6:]}  layers {span.start}:{span.end}  JOINING (loading weights)")
             if not missing:
                 weakest = min(online)
                 print(f"Every layer is online (thinnest layer has {weakest} server(s)). The swarm is usable.")
                 return 0
             print(f"Missing layers: {format_ranges(missing)} — the client cannot generate yet.")
+            if not spans and not joining:
+                print(
+                    "No server has announced anything under this prefix. Either none of them started,\n"
+                    "or they are using a different --dht_prefix. Check a server log:\n"
+                    "  bash examples/qwen_cluster.sh logs <node-id> 60"
+                )
 
             if not args.watch or time.monotonic() > deadline:
                 return 1
