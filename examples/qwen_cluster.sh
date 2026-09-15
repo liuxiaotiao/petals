@@ -2,6 +2,7 @@
 # Drive the whole private Qwen swarm over SSH from one control node.
 #
 #   examples/qwen_cluster.sh preflight # check every host can be deployed to, change nothing
+#   examples/qwen_cluster.sh plan      # size each host's blocks= from its free VRAM/disk
 #   examples/qwen_cluster.sh deploy    # rsync this repo to every host, build a venv
 #   examples/qwen_cluster.sh start     # bootstrap DHT, then every GPU server
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
@@ -117,10 +118,13 @@ free = "n/a"
 try:
     import torch
 
-    if torch.cuda.is_available():
+    if not torch.cuda.is_available():
+        free = "no-cuda"
+    else:
+        # Needs a real CUDA context, so this fails when the GPU is already saturated.
         free = "%.1fG" % (torch.cuda.mem_get_info(0)[0] / 1024**3)
-except Exception:
-    pass
+except Exception as exc:
+    free = "ERR-%s" % type(exc).__name__
 # huggingface.co serves the index; Xet-backed repos serve the actual bytes from xethub.
 print("hub=%s xet=%s vram_free=%s" % (
     probe("https://huggingface.co/api/models"),
@@ -130,18 +134,29 @@ print("hub=%s xet=%s vram_free=%s" % (
 PROBE
 )
 
-  # Clock skew, measured one host at a time so SSH latency does not pollute it.
-  # hivemind rejects peers more than MAX_DHT_TIME_DISCREPANCY_SECONDS (3s) apart.
-  local i skews=()
+  # Clock skew, one host at a time so SSH latency does not pollute the reading.
+  # hivemind compares peers to EACH OTHER (MAX_DHT_TIME_DISCREPANCY_SECONDS = 3s), so the
+  # bootstrap node is the reference; this control node's own clock is irrelevant.
+  local i raw=()
   for i in "${!IDS[@]}"; do
-    local t0 t1 remote_epoch
-    t0=$(date +%s)
-    remote_epoch=$(remote "${IPS[$i]}" "date +%s" 2>/dev/null || echo "")
-    t1=$(date +%s)
-    if [[ -z "$remote_epoch" ]]; then
+    local t0 t1 epoch
+    t0=$(date +%s.%N)
+    epoch=$(remote "${IPS[$i]}" "date +%s.%N" 2>/dev/null || echo "")
+    t1=$(date +%s.%N)
+    if [[ -z "$epoch" ]]; then
+      raw+=("nan")
+    else
+      raw+=("$(awk -v r="$epoch" -v a="$t0" -v b="$t1" 'BEGIN {printf "%.1f", r - (a + b) / 2}')")
+    fi
+  done
+  local bi; bi=$(index_of "$BOOTSTRAP_NODE")
+  local base="${raw[$bi]}"
+  local skews=()
+  for i in "${!IDS[@]}"; do
+    if [[ "${raw[$i]}" == nan || "$base" == nan ]]; then
       skews+=("?")
     else
-      skews+=("$(( remote_epoch - (t0 + t1) / 2 ))")
+      skews+=("$(awk -v x="${raw[$i]}" -v y="$base" 'BEGIN {printf "%+.1f", x - y}')")
     fi
   done
 
@@ -180,8 +195,13 @@ case \"\$torch\$venv\$git\$rsync\$github\$pypi\$net\" in *MISSING*|*UNREACHABLE*
     line=$(tail -1 "$STATE_DIR/out/${IDS[$i]}.preflight" 2>/dev/null)
     skew="${skews[$i]}"
     # hivemind's own limit is 3s; flag at 2s so there is margin.
-    if [[ "$skew" == "?" ]] || (( ${skew#-} >= 2 )); then mark="CLOCK-SKEW"; else mark="ok"; fi
-    printf '  %s clock=%ss/%s\n' "${line:-${IDS[$i]} no-response}" "$skew" "$mark"
+    if [[ "$skew" == "?" ]] || awk -v s="$skew" 'BEGIN {exit !(s < -2 || s > 2)}'; then
+      mark="CLOCK-SKEW"
+    else
+      mark="ok"
+    fi
+    printf '  %s clock=%ss-vs-%s/%s\n' \
+      "${line:-${IDS[$i]} no-response}" "$skew" "$BOOTSTRAP_NODE" "$mark"
     [[ "$line" == *MISSING* || "$line" == *UNREACHABLE* || -z "$line" || "$mark" != ok ]] && bad=$((bad + 1))
   done
   echo
@@ -367,6 +387,8 @@ if [ -f run/dht.pid ]; then kill \$(cat run/dht.pid) 2>/dev/null || true; rm -f 
 
 case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
+  plan)   shift; python3 examples/plan_blocks.py --state-dir "$STATE_DIR" \
+            --hosts-file "$HOSTS_FILE" "$@" ;;
   deploy) shift; cmd_deploy "$@" ;;
   start)  shift; cmd_start "$@" ;;
   status) shift; cmd_status "$@" ;;
@@ -376,5 +398,5 @@ case "${1:-}" in
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
             printf '%-5s %-16s %-6s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${PORTS[$i]}" \
               "${NBLOCKS[$i]:-(NUM_BLOCKS)}"; done ;;
-  *) sed -n '2,14p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,15p' "$0" >&2; exit 2 ;;
 esac
