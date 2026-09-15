@@ -452,8 +452,15 @@ if [ ! -f \"\$log\" ]; then
   exit 0
 fi
 lines=\$(wc -l < \"\$log\")
-last=\$(grep -aiE 'error|exception|traceback|assert|killed|no kernel image|out of memory' \"\$log\" | tail -1 | cut -c1-140)
-echo \"{ID} \$alive cache=\${cache:-0} lines=\$lines | \${last:-no error lines}\"
+# A dead server's last error can be hours old. Without the age of the log there is no
+# way to tell a problem happening now from the wreckage of one already fixed.
+now=\$(date +%s); mtime=\$(stat -c %Y \"\$log\" 2>/dev/null || echo \"\$now\")
+age=\$(( now - mtime ))
+if [ \"\$age\" -lt 120 ]; then age=\"\${age}s\"
+elif [ \"\$age\" -lt 7200 ]; then age=\"\$(( age / 60 ))m\"
+else age=\"\$(( age / 3600 ))h\"; fi
+last=\$(grep -aiE 'error|exception|traceback|assert|killed|no kernel image|out of memory' \"\$log\" | tail -1 | cut -c1-130)
+echo \"{ID} \$alive cache=\${cache:-0} lines=\$lines age=\$age | \${last:-no error lines}\"
 " || true
   local id
   for id in "${IDS[@]}"; do
@@ -481,6 +488,8 @@ tail -8 logs/dht.log 2>/dev/null | cut -c1-140 | sed 's/^/  /' || echo '  (no dh
 " 2>/dev/null || echo "  (host unreachable)"
 
   echo
+  echo "age= is how long since that log was last written: a DEAD host with an old age"
+  echo "is showing the wreckage of a past failure, not a live one."
   echo "cache= grows while weights download. DEAD with a traceback means it crashed;"
   echo "full log: bash examples/qwen_cluster.sh logs <node-id> 80"
   echo "If the DHT above is DEAD, every server will fail the same way -- fix it first."
