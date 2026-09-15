@@ -16,6 +16,8 @@
 #   examples/qwen_cluster.sh cleanup   # list stale/GPU-holding processes (kills nothing)
 #   examples/qwen_cluster.sh cleanup --ours --yes   # kill this deployment's leftovers
 #   examples/qwen_cluster.sh cleanup --gpu  --yes   # ALSO kill other processes on the GPU
+#   examples/qwen_cluster.sh cleanup --stale --yes  # kill only servers from an earlier
+#                                     # generation that survived a restart and still hold the port
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
 #   examples/qwen_cluster.sh stop      # stop the servers in HOSTS_FILE; leaves the DHT up
 #   examples/qwen_cluster.sh stop --dht  # also stop the bootstrap DHT (takes the whole swarm down)
@@ -802,16 +804,52 @@ tail -8 logs/dht.log 2>/dev/null | cut -c1-140 | sed 's/^/  /' || echo '  (no dh
 #   --gpu          ANY process holding GPU memory, including other people's jobs
 #   --yes          actually kill; without it this only reports
 cmd_cleanup() {
-  local want_ours=0 want_gpu=0 confirm=0 arg
+  local want_ours=0 want_gpu=0 want_stale=0 confirm=0 arg
   for arg in "$@"; do
     case "$arg" in
       --ours) want_ours=1 ;;
       --gpu)  want_gpu=1 ;;
+      --stale) want_stale=1 ;;
       --yes)  confirm=1 ;;
       *) echo "cleanup: unknown flag $arg" >&2; return 2 ;;
     esac
   done
-  (( want_ours || want_gpu )) || { want_ours=1; want_gpu=1; }   # dry run shows both
+  (( want_ours || want_gpu || want_stale )) || { want_ours=1; want_gpu=1; }   # dry run shows both
+
+  # --stale is the surgical one: kill servers from an EARLIER generation while leaving the
+  # current one running. A server that ignores SIGTERM keeps its p2pd bound to the Petals
+  # port, and because libp2p sets SO_REUSEPORT the new server binds the same port happily.
+  # Connections are then split between two peer ids, and clients fail the dial with a peer
+  # id mismatch against what the DHT advertises. --ours cannot be used for this: it would
+  # take down the healthy server too.
+  if (( want_stale )); then
+    echo "Stale servers (an earlier generation still holding the port):"
+    fanout stale "
+current=\$(cat '$REMOTE_DIR/run/server.pid' 2>/dev/null)
+if [ -z \"\$current\" ]; then echo '{ID} no pidfile -- cannot tell which generation is current'; exit 0; fi
+ps -eo pid=,ppid=,etimes=,args= | grep '[p]etals.cli.run_server' | while read -r pid ppid age rest; do
+  [ \"\$ppid\" = 1 ] || continue                 # children of the live server, not generations
+  [ \"\$pid\" = \"\$current\" ] && continue
+  echo \"{ID} STALE pid=\$pid age=\${age}s\"
+  if [ '$confirm' = 1 ]; then
+    kids=\$(ps -eo pid=,ppid= | while read -r p pp; do [ \"\$pp\" = \"\$pid\" ] && echo \"\$p\"; done)
+    kill -9 \$kids \$pid 2>/dev/null || true
+    echo \"{ID}   killed \$pid \${kids:+and children \$kids}\"
+  fi
+done
+echo \"{ID} live=\$current\"
+" || true
+    local id
+    for id in "${IDS[@]}"; do
+      sed 's/^/  /' "$STATE_DIR/out/$id.stale" 2>/dev/null || echo "  $id no-response"
+    done
+    if (( ! confirm )); then
+      echo
+      echo "Dry run. 'cleanup --stale --yes' kills the pids listed as STALE and their children."
+      echo "Nothing marked live= is touched."
+    fi
+    (( want_ours || want_gpu )) || return 0
+  fi
 
   if (( confirm && want_gpu )); then
     echo "WARNING: --gpu --yes kills every process holding GPU memory on all ${#IDS[@]} hosts," >&2

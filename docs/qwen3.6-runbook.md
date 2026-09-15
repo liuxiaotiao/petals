@@ -148,7 +148,7 @@ bash examples/qwen_cluster.sh client \
 | `status [--watch]` | 每台的进程状态 + 缓存大小 + 下载速率,加上 DHT 里的层覆盖 |
 | `diag` | 没上线时用:进程死活、缓存大小、日志最后一条错误 + 该错误有多旧、bootstrap DHT 状态 |
 | `logs <节点> [行数]` | 看某一台的服务端日志 |
-| `cleanup [--ours\|--gpu] [--yes]` | 列出/清理残留进程。默认只列不杀 |
+| `cleanup [--ours\|--gpu\|--stale] [--yes]` | 列出/清理残留进程。默认只列不杀。`--stale` 只杀**上一代**服务端,保留当前那个 |
 | `synctime [--yes]` | 看时钟偏差。全部 NTP 同步时会拒绝 `--yes` |
 | `hosts` | 打印解析出来的节点表 |
 | `stop [--dht]` | 停 `HOSTS_FILE` 里那些服务端。**默认不碰 bootstrap DHT**——停它等于停掉整个 swarm,包括当前 hosts 文件里没列的那些。`--dht` 才一并停 |
@@ -196,6 +196,40 @@ bash examples/qwen_cluster.sh start --restart          # 先停后起
 
 `start` 现在会在启动前打印一行 "Hub access: N host(s) via ...",没有代理时会明确警告。
 启动时扫一眼这行,比事后查十小时划算。
+
+### 客户端报 `peer id mismatch`
+
+```
+failed to dial 12D3Koo...1md61N: all dials failed
+  * [/ip4/192.168.1.2/tcp/9101] peer id mismatch: expected ...1md61N,
+    but remote key matches ...RSAABh
+```
+
+**一台机器上跑着两代服务端。** libp2p 用 SO_REUSEPORT,所以新旧两个 p2pd 能同时绑
+同一个端口,进来的连接在两者之间分配——DHT 广播的是新 peer id,而端口上有一半概率
+是旧进程应答。
+
+确认(注意:`pgrep -c` 数出来的是主进程加 fork 的子进程,**不能**用来判断有几代;
+要看启动时长):
+
+```bash
+ssh -n ubuntu@<节点IP> "ps -eo pid,ppid,etimes,args | grep '[p]etals.cli.run_server' \
+  | awk '{printf \"pid=%-8s ppid=%-8s age=%ss\\n\", \$1, \$2, \$3}'"
+ssh -n ubuntu@<节点IP> "ss -ltn | grep -c ':9101'"   # 正常是 2(v4+v6),4 就是两代
+```
+
+`age` 分成两簇、`ppid=1` 的有两个,就是它。清掉旧的那一代:
+
+```bash
+bash examples/qwen_cluster.sh cleanup --stale          # 先看
+bash examples/qwen_cluster.sh cleanup --stale --yes    # 再杀
+```
+
+`--stale` 只杀 `ppid=1` 且不等于 `run/server.pid` 的那些,当前服务端不受影响。
+**不要用 `--ours`**,那会把健康的那个一起杀掉。
+
+清完不用重启任何服务端:DHT 里指向旧代的记录会自己过期,而端口上不再有冒名顶替的
+进程,拨号立刻就正常了。
 
 ### `status` 长时间停在 JOINING
 
