@@ -263,6 +263,27 @@ def open_url(url, headers=None, timeout=20):
     return OPENER.open(urllib.request.Request(url, headers=headers or {}), timeout=timeout)
 
 
+def describe(exc):
+    """Name what actually went wrong, not the wrapper it arrived in.
+
+    A bare "UNREACHABLE" cannot tell a blocked port from a rejected certificate, and those
+    want opposite fixes -- one is the firewall, the other is this interpreter's CA bundle.
+    urllib buries the real failure in URLError.reason, so dig it out.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, urllib.error.URLError) and reason is not None:
+        name = reason if isinstance(reason, str) else type(reason).__name__
+        # A plain OSError names nothing useful; its strerror is the actual message,
+        # which is what separates a DNS failure from a refused connection.
+        if name == "OSError":
+            detail = getattr(reason, "strerror", None) or (reason.args[0] if reason.args else None)
+            if isinstance(detail, str):
+                name = detail
+    else:
+        name = type(exc).__name__
+    return str(name).replace(" ", "-")[:40]
+
+
 def probe(url):
     """An HTTP error still proves we reached the host; only a transport failure does not."""
     try:
@@ -270,8 +291,8 @@ def probe(url):
         return "ok"
     except urllib.error.HTTPError:
         return "ok"
-    except Exception:
-        return "UNREACHABLE"
+    except Exception as exc:
+        return "UNREACHABLE-%s" % describe(exc)
 
 
 def probe_weights(endpoint, model):
@@ -294,14 +315,14 @@ def probe_weights(endpoint, model):
         # Which one is the difference between "use another mirror" and "set HF_TOKEN",
         # so carry the code instead of collapsing both into one word.
         return "NO-INDEX-%d" % error.code
-    except Exception:
+    except Exception as exc:
         # Anything else never reached one, which is a network problem, not a repo problem.
-        return "UNREACHABLE"
+        return "UNREACHABLE-%s" % describe(exc)
     try:
         response = open_url(base + "/" + shard, headers={"Range": "bytes=0-0"}, timeout=30)
         return "ok" if response.read(1) else "EMPTY"
-    except Exception:
-        return "UNREACHABLE"
+    except Exception as exc:
+        return "UNREACHABLE-%s" % describe(exc)
 
 
 free = "n/a"
@@ -404,9 +425,15 @@ case \"\$net\" in *cdn=ok*) ;; *) exit 1 ;; esac
     echo "                 (rtt) means the offset was timed over SSH and is only good to a" >&2
     echo "                 second or two; (ntp) means the host's own daemon reported it." >&2
     echo "  xet=UNREACHABLE -> export HF_HUB_DISABLE_XET=1 and re-run; that makes this check pass" >&2
-    echo "  cdn=UNREACHABLE -> the API answered but real weight bytes did not arrive: allow" >&2
-    echo "                     *.cdn.hf.co and cdn-lfs*.huggingface.co, set HF_ENDPOINT to a" >&2
-    echo "                     mirror, or pre-seed the cache from a host whose egress works" >&2
+    echo "  cdn=UNREACHABLE-* -> no bytes arrived; the suffix says why:" >&2
+    echo "     -timed-out / -ConnectionRefusedError -> the firewall drops it: allow" >&2
+    echo "        *.cdn.hf.co and cdn-lfs*.huggingface.co, or point HF_ENDPOINT at a mirror" >&2
+    echo "     -SSLCertVerificationError -> something is terminating TLS in the middle and" >&2
+    echo "        this interpreter does not trust its CA. curl may still work here, because" >&2
+    echo "        it reads the system store while Python reads certifi. Point the venv at" >&2
+    echo "        the system bundle (SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt) or" >&2
+    echo "        add the CA to certifi -- do NOT disable verification" >&2
+    echo "     -NameResolutionError -> DNS does not resolve that host from this node" >&2
     echo "  cdn=NO-INDEX-404 -> that endpoint does not carry $MODEL_NAME; try another mirror" >&2
     echo "  cdn=NO-INDEX-401/403 -> the repo is gated: accept its terms and set HF_TOKEN" >&2
     echo "  vram_free=ERR-* -> CUDA context could not be created; the GPU is full or wedged" >&2
