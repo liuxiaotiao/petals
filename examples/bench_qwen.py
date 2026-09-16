@@ -66,6 +66,12 @@ def one_session(model, prompt_ids, new_tokens, out, index):
     out[index] = (first, steps)
 
 
+def say(*parts, end="\n"):
+    """Print and flush. Over ssh stdout is a pipe, so block buffering makes a run that takes
+    minutes show nothing at all until it ends, which is indistinguishable from a hang."""
+    print(*parts, end=end, flush=True)
+
+
 def percentile(values, fraction):
     """Nearest-rank: the smallest value at least this fraction of the sample is below."""
     ordered = sorted(values)
@@ -131,43 +137,46 @@ def main():
     # A synthetic prompt keeps the prompt length exact, which is what the timings are indexed on.
     prompt_ids = torch.randint(0, tokenizer.vocab_size, (1, args.prompt_tokens))
 
-    print(f"\nmodel {args.model}  dtype {args.torch_dtype}")
-    print(f"prompt {args.prompt_tokens} tokens, {args.new_tokens} generated per session\n")
+    say(f"\nmodel {args.model}  dtype {args.torch_dtype}")
+    say(f"prompt {args.prompt_tokens} tokens, {args.new_tokens} generated per session\n")
 
+    say("warming up (route discovery and cache allocation on every hop) ...")
     for _ in range(args.warmup):
         # The first run pays for route discovery and cache allocation on every hop.
         run(model, prompt_ids, min(4, args.new_tokens), 1)
 
     header = f"{'sessions':>8} {'TTFT ms':>9} {'median ms':>10} {'p90 ms':>8} {'tok/s/sess':>11} {'tok/s total':>12}"
-    print(header)
-    print("-" * len(header))
+    say(header)
+    say("-" * len(header))
     baseline = None
+    result = None
     for concurrency in args.concurrency:
+        say(f"{concurrency:>8}   measuring ...", end="\r")
         result = run(model, prompt_ids, args.new_tokens, concurrency)
         if result is None:
-            print(f"{concurrency:>8}   no successful session")
+            say(f"{concurrency:>8}   no successful session")
             continue
         if baseline is None:
             baseline = result["aggregate_tps"]
-        print(
+        say(
             f"{concurrency:>8} {result['ttft_ms']:>9.0f} {result['median_ms']:>10.0f}"
             f" {result['p90_ms']:>8.0f} {result['per_session_tps']:>11.2f}"
             f" {result['aggregate_tps']:>12.2f}"
         )
 
     if baseline and len(args.concurrency) > 1:
-        print(
+        say(
             f"\nscaling vs {args.concurrency[0]} session(s): "
             f"{result['aggregate_tps'] / baseline:.2f}x at {args.concurrency[-1]} sessions"
         )
-        print("Well below linear means the pipeline, not the client, is the limit:")
-        print("every session shares the same servers, and each hop serves them one batch at a time.")
+        say("Well below linear means the pipeline, not the client, is the limit:")
+        say("every session shares the same servers, and each hop serves them one batch at a time.")
 
     routes = sorted(set(recorder.routes))
     if routes:
-        print(f"\nroutes used ({len(recorder.routes)} sessions, {len(routes)} distinct):")
+        say(f"\nroutes used ({len(recorder.routes)} sessions, {len(routes)} distinct):")
         for route in routes[:6]:
-            print(f"  {route}")
+            say(f"  {route}")
 
 
 if __name__ == "__main__":
