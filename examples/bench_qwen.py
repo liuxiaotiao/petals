@@ -105,29 +105,43 @@ def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
 
 
 def run(model, prompt_ids, new_tokens, concurrency, timeout):
+    """Run `concurrency` sessions and summarize them.
+
+    Every session goes on a worker thread, including a single one. Running one inline looked
+    tidier and cost the only thing enforcing --timeout -- join(timeout) IS the timeout, and a
+    benchmark that cannot give up is worse than one that reports a failure. Threading was also
+    suspected of causing a hang and is not: the hang reproduced identically inline.
+    """
     out = [None] * concurrency
-
-    # One session runs on this thread. Petals' client keeps per-session state in a ContextVar
-    # and does its I/O on hivemind's event loop; putting a single session on a worker thread
-    # adds that difference for no benefit, and it is exactly the difference between this and
-    # the client script that is known to work. Threads are only for measuring concurrency.
-    if concurrency == 1:
-        wall_start = perf_counter()
-        one_session(model, prompt_ids, new_tokens, out, 0, trace=True)
-        wall = perf_counter() - wall_start
-        return summarize(out, wall, concurrency)
-
     threads = [
-        threading.Thread(target=one_session, args=(model, prompt_ids, new_tokens, out, i), daemon=True)
+        threading.Thread(
+            target=one_session,
+            args=(model, prompt_ids, new_tokens, out, i),
+            kwargs={"trace": concurrency == 1},
+            daemon=True,
+        )
         for i in range(concurrency)
     ]
     wall_start = perf_counter()
     for thread in threads:
         thread.start()
-    for thread in threads:
-        # A hop that never answers would otherwise block here forever. Bounded waits turn
-        # that into a reported failure instead of an overnight silence.
-        thread.join(timeout)
+
+    deadline = perf_counter() + timeout
+    while perf_counter() < deadline and any(thread.is_alive() for thread in threads):
+        # Say something while waiting: an alive-but-slow run and a wedged one look identical
+        # otherwise, and that difference decides whether to wait or go look at the servers.
+        # Wait on a thread that is still running; joining an already-finished one
+        # returns instantly and turns this into a busy loop.
+        alive = next((t for t in threads if t.is_alive()), None)
+        if alive is None:
+            break
+        alive.join(min(15, max(0.1, deadline - perf_counter())))
+        if any(thread.is_alive() for thread in threads):
+            done = sum(1 for r in out if r is not None)
+            say(
+                f"  ... {timeout - (deadline - perf_counter()):.0f}s elapsed," f" {done}/{concurrency} finished",
+                end="\r",
+            )
     wall = perf_counter() - wall_start
     return summarize(out, wall, concurrency)
 
