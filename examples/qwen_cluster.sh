@@ -12,6 +12,7 @@
 #                                     # the only way to change a running server's environment
 #   examples/qwen_cluster.sh status    # per-host process state + layer coverage
 #   examples/qwen_cluster.sh client --prompt '...'   # generate, from a node that has Petals
+#   examples/qwen_cluster.sh bench --concurrency 1 4 8  # TTFT, decode speed, does it scale
 #   examples/qwen_cluster.sh diag      # why is nothing online: alive? downloading? crashed?
 #   examples/qwen_cluster.sh cleanup   # list stale/GPU-holding processes (kills nothing)
 #   examples/qwen_cluster.sh cleanup --ours --yes   # kill this deployment's leftovers
@@ -1096,7 +1097,10 @@ fi
 # need one: every deployed host already has the venv, the repo and a warm tokenizer cache.
 # CLIENT_NODE defaults to the proxy node, which by definition can reach the Hub.
 cmd_client() {
+  # bench is the same plumbing with a different script: the env that is easy to get wrong
+  # (peer address, proxy, revision) stays identical between generating and measuring.
   local node="$CLIENT_NODE"
+  local CLIENT_SCRIPT="${CLIENT_SCRIPT:-qwen_generate.py}"
   if [[ "${1:-}" == --node ]]; then node="$2"; shift 2; fi
   local i; i=$(index_of "$node")
   local peer
@@ -1104,7 +1108,7 @@ cmd_client() {
     echo "No bootstrap address; is the swarm running?" >&2; exit 1
   }
 
-  # Anything after the subcommand goes to qwen_generate.py untouched, so its own flags
+  # Anything after the subcommand goes to that script untouched, so its own flags
   # (--prompt, --max-new-tokens, --revision, --dht-prefix) work without being mirrored here.
   local args=""
   local a
@@ -1118,7 +1122,7 @@ cd '$REMOTE_DIR/repo'
 HF_HUB_DISABLE_XET='${HF_HUB_DISABLE_XET:-1}' \
 PETALS_MAX_RETRIES='${PETALS_MAX_RETRIES:-3}' \
 $(proxy_env_for "$node")\
-"\$HOME/$REMOTE_DIR/venv/bin/python" examples/qwen_generate.py \
+"\$HOME/$REMOTE_DIR/venv/bin/python" examples/$CLIENT_SCRIPT \
   --initial-peers '$peer' --model '$MODEL_NAME'${MODEL_REVISION:+ --revision '$MODEL_REVISION'}$args
 "
 }
@@ -1464,6 +1468,7 @@ case "${1:-}" in
   logs)   shift; cmd_logs "$@" ;;
   proxy)  shift; cmd_proxy "$@" ;;
   client) shift; cmd_client "$@" ;;
+  bench)  shift; CLIENT_SCRIPT=bench_qwen.py; cmd_client "$@" ;;
   service) shift; cmd_service "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   hosts)  printf '%-5s %-16s %-6s %s\n' NODE ADDRESS PORT BLOCKS; for i in "${!IDS[@]}"; do
