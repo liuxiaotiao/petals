@@ -251,7 +251,6 @@ class Server:
         gib = 1024**3
         self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
         logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
-        self._warn_if_cache_outgrows_device(num_blocks)
 
         assert isinstance(throughput, float) or throughput in ["auto", "eval", "dry_run"]
         if throughput in ["auto", "eval", "dry_run"]:
@@ -297,32 +296,6 @@ class Server:
 
         self.module_container = None
         self.stop = threading.Event()
-
-    def _warn_if_cache_outgrows_device(self, num_blocks: int) -> None:
-        """The cache budget is a ceiling, not a reservation.
-
-        MemoryCache only counts bytes; the tensors themselves are allocated per session, when one
-        arrives. So a budget larger than the card can spare does not fail at startup -- the server
-        keeps admitting sessions until CUDA runs out inside the runtime, which is far worse than
-        the AllocationFailed the client already knows how to reroute around. Say so at startup,
-        while the number is still easy to change.
-        """
-        if self.device is None or self.device.type != "cuda" or len(self.tensor_parallel_devices) != 1:
-            return
-        try:
-            total_memory = torch.cuda.get_device_properties(self.device).total_memory
-        except Exception:  # A device that cannot be queried is not a reason to refuse to start.
-            return
-        block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
-        headroom = total_memory - block_size * num_blocks
-        if self.attn_cache_bytes > headroom:
-            gib = 1024**3
-            logger.warning(
-                f"The attention cache may grow to {self.attn_cache_bytes / gib:.2f} GiB, but {num_blocks} blocks "
-                f"leave only about {headroom / gib:.2f} GiB on {self.device}. Cache is allocated per session, so "
-                f"this server will accept sessions until CUDA itself runs out instead of refusing them cleanly. "
-                f"Lower --attn_cache_tokens, or serve fewer blocks."
-            )
 
     def _choose_num_blocks(self) -> int:
         assert self.device.type in ("cuda", "mps"), (

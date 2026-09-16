@@ -10,11 +10,24 @@ model="${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
 port="${PORT:-31330}"
 python_bin="${PYTHON:-python}"
 
+# INFERENCE_MAX_LENGTH caps prompt + generated tokens for ONE session; 4096 is 2048 in and 2048
+# out. The client reserves exactly prompt + max_new_tokens per session, so this bounds the worst
+# case a single caller can demand, and does not make short requests any cheaper.
+#
+# ATTN_CACHE_TOKENS is the cache BUDGET, not a reservation: per block it prices the larger of one
+# full-attention layer's K/V and one linear-attention layer's history+state at that many tokens,
+# times the blocks served, and the tensors are then allocated per session. A session costs a fixed
+# conv/recurrent state per linear block plus a per-token history, so concurrency is bounded by the
+# budget rather than by context length. On an 8-block span, 65536 allows ~2.0 GiB, which is 16
+# concurrent 4096-token sessions or 30 at 2048. Raising it past what the card can spare turns a
+# clean AllocationFailed (which the client reroutes around) into a hard CUDA OOM; the server warns
+# at startup when the budget exceeds the memory its blocks leave free.
 args=(
   "$model" --port "$port"
   --initial_peers "$BOOTSTRAP_PEER"
   --torch_dtype "${TORCH_DTYPE:-float16}" --quant_type none --device "${DEVICE:-cuda:0}" --inference_only
-  --inference_max_length 2048 --attn_cache_tokens 4096
+  --inference_max_length "${INFERENCE_MAX_LENGTH:-4096}"
+  --attn_cache_tokens "${ATTN_CACHE_TOKENS:-65536}"
   --max_batch_size 256 --max_chunk_size_bytes 16777216
   --num_handlers 2 --no_auto_relay
 )

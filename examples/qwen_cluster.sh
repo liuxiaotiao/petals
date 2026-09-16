@@ -601,7 +601,8 @@ echo \$! > run/dht.pid
   # Pass through only the knobs that are set, so run_qwen_server.sh keeps its own defaults.
   local passthrough=""
   local name
-  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY DHT_PREFIX MODEL_REVISION \
+  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY ATTN_CACHE_TOKENS \
+              INFERENCE_MAX_LENGTH DHT_PREFIX MODEL_REVISION \
               HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     [[ -n "${!name:-}" ]] && passthrough+="$name='${!name}' "
   done
@@ -1151,7 +1152,8 @@ service_env() {  # service_env <index> <peer>
   printf 'MAX_DISK_SPACE=%s\n' "$MAX_DISK_SPACE"
   # The host's own blocks= wins over a NUM_BLOCKS inherited from this shell.
   if [[ -n "${NBLOCKS[$i]}" ]]; then printf '%s\n' "$(blocks_var_for "$i")"; fi
-  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY DHT_PREFIX MODEL_REVISION \
+  for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY ATTN_CACHE_TOKENS \
+              INFERENCE_MAX_LENGTH DHT_PREFIX MODEL_REVISION \
               HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN; do
     [[ "$name" == NUM_BLOCKS || "$name" == BLOCKS ]] && [[ -n "${NBLOCKS[$i]}" ]] && continue
     [[ -n "${!name:-}" ]] && printf '%s=%s\n' "$name" "${!name}"
@@ -1188,7 +1190,8 @@ cmd_service() {
         local id="${IDS[$i]}"
         local shows="blocks=${NBLOCKS[$i]:-auto}"
         proxy_applies_to "$id" && shows+=" proxy=yes" || shows+=" proxy=no"
-        printf '%-5s %-22s ' "$id" "$shows"
+        shows+=" cache=${ATTN_CACHE_TOKENS:-65536}/${INFERENCE_MAX_LENGTH:-4096}"
+        printf '%-5s %-36s ' "$id" "$shows"
         # The unit text is built here, fully substituted, so nothing extra has to be
         # deployed and there is one place to read when the behaviour is in question.
         remote "${IPS[$i]}" "

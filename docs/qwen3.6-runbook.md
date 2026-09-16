@@ -35,6 +35,8 @@ export MAX_DISK_SPACE=30GB         # 每台 HF 缓存上限
 export PROXY_NODE=N08              # 借出口的那台
 export PROXY_SKIP="N06 N07"        # 这两台自己有出口,别绕道
 export CLEANUP_ON_START=gpu        # start 前先清掉占卡的外来进程
+# export ATTN_CACHE_TOKENS=65536   # 每台的 KV/状态预算,决定并发上限。见 4.5
+# export INFERENCE_MAX_LENGTH=4096 # 单个会话 prompt+生成 的上限。见 4.5
 ```
 
 不设 `HF_ENDPOINT` 就走 `huggingface.co`。hf-mirror 也验证过可用,
@@ -200,6 +202,7 @@ sudo loginctl enable-linger $(id -un)
 | `proxy start\|stop\|status\|logs` | 在 `PROXY_NODE` 上起 CONNECT 代理,并让其余节点经它访问 HF |
 | `start [--restart]` | 起 bootstrap DHT,再起所有 GPU 服务端。默认跳过已在跑的;`--restart` 先停后起,**改环境变量的唯一办法** |
 | `client [--node N] [...]` | 在某个节点上跑生成,参数转给 `qwen_generate.py`。控制节点不需要装 petals |
+| `bench [...]` | 在某个节点上跑吞吐基准,参数转给 `bench_qwen.py`(`--concurrency`/`--new-tokens`/`--timeout`/`--inline`) |
 | `status [--watch]` | 每台的进程状态 + 缓存大小 + 下载速率,加上 DHT 里的层覆盖 |
 | `diag` | 没上线时用:进程死活、缓存大小、日志最后一条错误 + 该错误有多旧、bootstrap DHT 状态 |
 | `logs <节点> [行数]` | 看某一台的服务端日志 |
@@ -208,6 +211,53 @@ sudo loginctl enable-linger $(id -un)
 | `hosts` | 打印解析出来的节点表 |
 | `service {install\|start\|stop\|restart\|status\|logs\|uninstall}` | systemd 用户单元:崩溃自愈 + 开机自启。装了之后用它代替 `start`/`stop` |
 | `stop [--dht]` | 停 `HOSTS_FILE` 里那些服务端。**默认不碰 bootstrap DHT**——停它等于停掉整个 swarm,包括当前 hosts 文件里没列的那些。`--dht` 才一并停 |
+
+---
+
+## 4.5 会话长度与并发上限
+
+两个参数,作用不一样,别混:
+
+**`INFERENCE_MAX_LENGTH`(默认 4096)** 卡的是**单个会话** prompt + 生成的**总和**,
+即 2048 进 + 2048 出。客户端每次申请的是 `prompt + max_new_tokens`
+(`remote_generation.py:110`),服务端就按这个数记账——所以这个上限只决定
+**一个调用者最坏能要多少**,并不会让短请求变便宜。超了服务端直接拒:
+`Cannot allocate KV cache for N tokens, max = 4096`。
+
+**`ATTN_CACHE_TOKENS`(默认 65536)** 是缓存**预算**,不是预留。`MemoryCache` 只记字节数,
+张量在会话进来时才真分配。所以预算开得比显卡余量大**不会**在启动时报错,而是让服务端
+一直收会话直到 CUDA 自己 OOM——这比干净的 `AllocationFailed`(客户端会重试并绕路)糟得多。
+启动时预算超过本机层数留下的余量,服务端会打一条 warning。
+
+一个会话在 8 层 span 上的开销是**仿射的**:
+
+```
+  12,976,176 字节   6 个 linear_attention 层的 conv + recurrent state,与长度无关
++     28,672 字节 × (prompt + 生成)
+```
+
+那 28,672 里有 24,576 是 linear 层的 `history` 缓冲(`block.py:188`):linear 的递归状态
+没法像 KV 那样切片,Petals 回退会话时只能拿原始块输入重放,所以必须留住全部输入。
+这是容错的代价,长会话贵就贵在这里。
+
+| `ATTN_CACHE_TOKENS` | 预算(8层 / 7层) | 并发 @4096 | 并发 @2048 | 并发 @256 |
+|---|---|---|---|---|
+| 16384 | 0.52 / 0.45 GiB | 4 / 3 | 7 / 7 | 27 / 24 |
+| 32768 | 1.02 / 0.89 GiB | 8 / 7 | 15 / 14 | 53 / 48 |
+| **65536(现默认)** | **2.02 / 1.76 GiB** | **16 / 15** | **30 / 28** | **106 / 95** |
+| 131072 | 4.02 / 3.51 GiB | 33 / 30 | 60 / 55 | 212 / 190 |
+
+改法:`export ATTN_CACHE_TOKENS=...`,`service install` + `service restart`
+(没装 systemd 单元就 `start --restart`)。这是启动参数,不重启不生效。
+`service install` 每行会打出生效的 `cache=预算/单会话上限`,不用猜写进去的是什么。
+
+**预算满了不是崩溃。** 服务端回 `Could not allocate N bytes immediately: out of memory`,
+客户端重试并重新路由,那台在 `status` 里仍然是 ONLINE,会话结束就把空间还回去。
+不用重启任何东西。
+
+**T4 要看一眼。** 16GB 卡放 7 层权重之后余量不多,65536 的预算是 1.76 GiB。
+重启后 `service logs N12` 里如果有 "may grow to ... but ... leave only about ..." 这条
+warning,就把 `ATTN_CACHE_TOKENS` 调小重装。
 
 ---
 
