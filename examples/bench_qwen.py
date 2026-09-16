@@ -85,7 +85,24 @@ def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
     out[index] = ("ok", (ttft, [per_token] * (new_tokens - 1)))
 
 
-def run(model, prompt_ids, new_tokens, concurrency, timeout):
+def arm_watchdog(seconds):
+    """Force an exit if nothing comes back.
+
+    Needed for the inline path, where there is no thread to join with a timeout. Blunt, but a
+    benchmark that cannot end is the failure mode this script has already had twice.
+    """
+
+    def fire():
+        say(f"\nTIMED OUT after {seconds:.0f}s with no result; exiting.")
+        os._exit(3)
+
+    timer = threading.Timer(seconds, fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def run(model, prompt_ids, new_tokens, concurrency, timeout, inline=False):
     """Run `concurrency` sessions and summarize them.
 
     Every session goes on a worker thread, including a single one. Running one inline looked
@@ -94,6 +111,18 @@ def run(model, prompt_ids, new_tokens, concurrency, timeout):
     suspected of causing a hang and is not: the hang reproduced identically inline.
     """
     out = [None] * concurrency
+
+    # Whether generate() runs on this thread or a worker one is the last untested difference
+    # against the client that works. Keeping both paths makes it an A/B rather than an
+    # argument, and inline is the one the client itself uses.
+    if inline and concurrency == 1:
+        timer = arm_watchdog(timeout)
+        wall_start = perf_counter()
+        one_session(model, prompt_ids, new_tokens, out, 0, trace=True)
+        wall = perf_counter() - wall_start
+        timer.cancel()
+        return summarize(out, wall, concurrency)
+
     threads = [
         threading.Thread(
             target=one_session,
@@ -178,6 +207,11 @@ def main():
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="run a single session on the main thread instead of a worker thread",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=600,
@@ -202,11 +236,11 @@ def main():
 
     say(f"\nmodel {args.model}  servers float16, client-side layers {args.torch_dtype}")
     say(f"prompt {prompt_ids.shape[1]} tokens, {args.new_tokens} generated per session")
-    say(f"per-level timeout {args.timeout:.0f}s\n")
+    say(f"per-level timeout {args.timeout:.0f}s, single session on {'this' if args.inline else 'a worker'} thread\n")
 
     for _ in range(args.warmup):
         say("warming up (route discovery and cache allocation on every hop) ...")
-        warm = run(model, prompt_ids, min(4, args.new_tokens), 1, args.timeout)
+        warm = run(model, prompt_ids, min(4, args.new_tokens), 1, args.timeout, args.inline)
         if warm.get("failed"):
             say(f"warmup failed: {warm['errors'] or 'timed out'}")
             say("The swarm is not answering; check 'status' and 'diag' before reading further.")
@@ -219,7 +253,7 @@ def main():
     last = None
     for concurrency in args.concurrency:
         say(f"{concurrency:>8}   measuring ...", end="\r")
-        result = run(model, prompt_ids, args.new_tokens, concurrency, args.timeout)
+        result = run(model, prompt_ids, args.new_tokens, concurrency, args.timeout, args.inline)
         if result.get("failed"):
             say(f"{concurrency:>8}   FAILED: {result['errors'] or 'all sessions timed out'}")
             continue
