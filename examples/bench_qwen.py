@@ -41,16 +41,18 @@ class RouteRecorder(logging.Handler):
     def __init__(self):
         super().__init__()
         self.routes = []
-        self.lock = threading.Lock()
 
     def emit(self, record):
+        # No lock here, and nothing may be named self.lock: logging.Handler already owns that
+        # attribute and handle() holds it while calling emit(). Shadowing it with a plain Lock
+        # and re-acquiring it deadlocks every thread that logs -- which, since this is attached
+        # to the root logger, is the client's own routing code. list.append is atomic anyway.
         try:
             message = record.getMessage()
         except Exception:
             return
         if "Route found" in message:
-            with self.lock:
-                self.routes.append(message.split("Route found:", 1)[-1].strip())
+            self.routes.append(message.split("Route found:", 1)[-1].strip())
 
 
 def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
