@@ -85,12 +85,13 @@ def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
     ticker = Ticker(trace=trace)
     start = perf_counter()
     try:
-        model.generate(
-            prompt_ids,
-            max_new_tokens=new_tokens,
-            do_sample=False,
-            streamer=ticker,
-        )
+        with torch.inference_mode():
+            model.generate(
+                prompt_ids,
+                max_new_tokens=new_tokens,
+                do_sample=False,
+                streamer=ticker,
+            )
     except Exception as error:  # a failed session must not take the whole run down
         out[index] = ("error", repr(error)[:200])
         return
@@ -187,7 +188,12 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B")
     parser.add_argument("--revision", default=None)
     parser.add_argument("--dht-prefix", default=None)
-    parser.add_argument("--torch-dtype", default="float16", choices=sorted(DTYPES))
+    # float32, not the servers' float16. Only the embeddings, the final norm and the LM
+    # head run here, on CPU, and CPU fp16 is emulated in software -- the LM head alone is
+    # a hidden x vocab matmul, so fp16 turns "waiting on the swarm" into "waiting on this
+    # machine" and a benchmark measures the wrong computer. The working client says the
+    # same thing in its own comment; ignoring it cost a night of silent runs.
+    parser.add_argument("--torch-dtype", default="float32", choices=sorted(DTYPES))
     parser.add_argument("--prompt-tokens", type=int, default=128)
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
@@ -211,10 +217,11 @@ def main():
         revision=args.revision,
         dht_prefix=args.dht_prefix,
         torch_dtype=DTYPES[args.torch_dtype],
+        max_retries=3,  # the default behaves as unlimited, which hides a failure as a hang
     )
     prompt_ids = build_prompt(tokenizer, args.prompt_tokens)
 
-    say(f"\nmodel {args.model}  dtype {args.torch_dtype}")
+    say(f"\nmodel {args.model}  servers float16, client-side layers {args.torch_dtype}")
     say(f"prompt {prompt_ids.shape[1]} tokens, {args.new_tokens} generated per session")
     say(f"per-level timeout {args.timeout:.0f}s\n")
 
