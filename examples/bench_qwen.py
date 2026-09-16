@@ -4,11 +4,12 @@ Petals is a pipeline, not a replica set. One request's speed is the sum of its h
 servers do not make a single request faster -- what they buy is running more requests at once.
 A single number hides that, so this reports one session and N sessions side by side.
 
-Timing comes from a streamer attached to an ordinary generate() call. The obvious alternative,
-calling generate(max_new_tokens=1) in a loop, would exercise Petals' session-resume path on
-every single token; that path is not what the working client uses, and taking it here once hung
-a benchmark overnight with no output. Staying on the same path as the client means a number
-produced here describes the same thing a user would experience.
+Timing comes from two plain generate() calls per session, because on this adapter the richer
+options do not return: a per-token streamer hangs, and so does the generate(max_new_tokens=1)
+loop that would exercise Petals' session-resume path. Both were bisected against the working
+client -- same prompt, same route, same dtype -- and only those differences mattered. So this
+stays on exactly the call the client makes, and infers decode speed from the gap between a
+one-token run and an N-token one.
 
   bash examples/qwen_cluster.sh bench --concurrency 1 4
 """
@@ -34,29 +35,6 @@ def say(*parts, end="\n"):
     print(*parts, end=end, flush=True)
 
 
-class Ticker:
-    """Timestamp each token as generate() emits it.
-
-    Transformers calls put() once with the prompt and then once per generated token, so the
-    first interval is time-to-first-token and the rest are the decode steps.
-    """
-
-    def __init__(self, trace=False):
-        self.stamps = []
-        self.trace = trace
-
-    def put(self, value):
-        self.stamps.append(perf_counter())
-        if self.trace:
-            # Seeing the first dot appear separates "the swarm is slow" from "nothing ever
-            # came back", which no summary printed at the end can tell you.
-            say("." if len(self.stamps) > 1 else "[prompt]", end="")
-
-    def end(self):
-        if self.trace:
-            say("")
-
-
 class RouteRecorder(logging.Handler):
     """Keep the 'Route found' lines: a slow run is only interpretable with the path taken."""
 
@@ -75,34 +53,36 @@ class RouteRecorder(logging.Handler):
                 self.routes.append(message.split("Route found:", 1)[-1].strip())
 
 
-def percentile(values, fraction):
-    """Nearest-rank: the smallest value at least this fraction of the sample is below."""
-    ordered = sorted(values)
-    return ordered[max(1, math.ceil(len(ordered) * fraction)) - 1]
-
-
 def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
-    ticker = Ticker(trace=trace)
-    start = perf_counter()
+    """Time one session with two plain generate() calls and nothing else.
+
+    The obvious design attaches a streamer and timestamps every token. On this adapter that
+    call never returns -- same prompt, same route, same dtype, only the streamer differs --
+    so this measures the way the working client calls the model and accepts coarser numbers:
+    one call for the first token, one for the whole sequence, decode inferred from the gap.
+    A benchmark that runs on the proven path beats a richer one that hangs.
+    """
     try:
         with torch.inference_mode():
-            model.generate(
-                prompt_ids,
-                max_new_tokens=new_tokens,
-                do_sample=False,
-                streamer=ticker,
-            )
+            start = perf_counter()
+            model.generate(prompt_ids, max_new_tokens=1, do_sample=False)
+            ttft = perf_counter() - start
+            if trace:
+                say(f"  first token in {ttft:.1f}s, now generating {new_tokens} ...")
+
+            start = perf_counter()
+            model.generate(prompt_ids, max_new_tokens=new_tokens, do_sample=False)
+            total = perf_counter() - start
     except Exception as error:  # a failed session must not take the whole run down
         out[index] = ("error", repr(error)[:200])
         return
-    stamps = ticker.stamps
-    if len(stamps) < 2:
-        out[index] = ("error", f"streamer saw {len(stamps)} events")
+
+    if new_tokens < 2:
+        out[index] = ("error", "need at least 2 new tokens to separate decode from prefill")
         return
-    # stamps[0] is the prompt echo, stamps[1] the first generated token.
-    ttft = stamps[1] - start
-    steps = [b - a for a, b in zip(stamps[1:], stamps[2:])]
-    out[index] = ("ok", (ttft, steps))
+    # The second call pays the same prefill, so the difference is the extra decode steps.
+    per_token = max(1e-6, (total - ttft) / (new_tokens - 1))
+    out[index] = ("ok", (ttft, [per_token] * (new_tokens - 1)))
 
 
 def run(model, prompt_ids, new_tokens, concurrency, timeout):
@@ -162,7 +142,6 @@ def summarize(out, wall, concurrency):
         "failed": False,
         "ttft_ms": statistics.median(first_tokens) * 1000,
         "median_ms": statistics.median(all_steps) * 1000,
-        "p90_ms": percentile(all_steps, 0.9) * 1000,
         "per_session_tps": 1 / statistics.median(all_steps),
         # Every token produced over the wall clock that produced them, first tokens included.
         "aggregate_tps": (len(all_steps) + len(first_tokens)) / wall,
@@ -233,9 +212,7 @@ def main():
             say("The swarm is not answering; check 'status' and 'diag' before reading further.")
             return 1
 
-    header = (
-        f"{'sessions':>8} {'TTFT ms':>9} {'median ms':>10} {'p90 ms':>8}" f" {'tok/s/sess':>11} {'tok/s total':>12}"
-    )
+    header = f"{'sessions':>8} {'TTFT ms':>9} {'ms/token':>10}" f" {'tok/s/sess':>11} {'tok/s total':>12}"
     say(header)
     say("-" * len(header))
     baseline = None
@@ -254,7 +231,7 @@ def main():
             note = f"  ({result['sessions_ok']}/{concurrency} finished)"
         say(
             f"{concurrency:>8} {result['ttft_ms']:>9.0f} {result['median_ms']:>10.0f}"
-            f" {result['p90_ms']:>8.0f} {result['per_session_tps']:>11.2f}"
+            f" {result['per_session_tps']:>11.2f}"
             f" {result['aggregate_tps']:>12.2f}{note}"
         )
 
