@@ -41,14 +41,20 @@ class Ticker:
     first interval is time-to-first-token and the rest are the decode steps.
     """
 
-    def __init__(self):
+    def __init__(self, trace=False):
         self.stamps = []
+        self.trace = trace
 
     def put(self, value):
         self.stamps.append(perf_counter())
+        if self.trace:
+            # Seeing the first dot appear separates "the swarm is slow" from "nothing ever
+            # came back", which no summary printed at the end can tell you.
+            say("." if len(self.stamps) > 1 else "[prompt]", end="")
 
     def end(self):
-        pass
+        if self.trace:
+            say("")
 
 
 class RouteRecorder(logging.Handler):
@@ -75,8 +81,8 @@ def percentile(values, fraction):
     return ordered[max(1, math.ceil(len(ordered) * fraction)) - 1]
 
 
-def one_session(model, prompt_ids, new_tokens, out, index):
-    ticker = Ticker()
+def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
+    ticker = Ticker(trace=trace)
     start = perf_counter()
     try:
         model.generate(
@@ -100,6 +106,17 @@ def one_session(model, prompt_ids, new_tokens, out, index):
 
 def run(model, prompt_ids, new_tokens, concurrency, timeout):
     out = [None] * concurrency
+
+    # One session runs on this thread. Petals' client keeps per-session state in a ContextVar
+    # and does its I/O on hivemind's event loop; putting a single session on a worker thread
+    # adds that difference for no benefit, and it is exactly the difference between this and
+    # the client script that is known to work. Threads are only for measuring concurrency.
+    if concurrency == 1:
+        wall_start = perf_counter()
+        one_session(model, prompt_ids, new_tokens, out, 0, trace=True)
+        wall = perf_counter() - wall_start
+        return summarize(out, wall, concurrency)
+
     threads = [
         threading.Thread(target=one_session, args=(model, prompt_ids, new_tokens, out, i), daemon=True)
         for i in range(concurrency)
@@ -112,7 +129,10 @@ def run(model, prompt_ids, new_tokens, concurrency, timeout):
         # that into a reported failure instead of an overnight silence.
         thread.join(timeout)
     wall = perf_counter() - wall_start
+    return summarize(out, wall, concurrency)
 
+
+def summarize(out, wall, concurrency):
     good = [payload for status, payload in (r for r in out if r) if status == "ok"]
     errors = [payload for status, payload in (r for r in out if r) if status == "error"]
     unfinished = sum(1 for r in out if r is None)
