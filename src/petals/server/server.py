@@ -217,7 +217,7 @@ class Server:
         cache_values_per_block //= self.block_config.num_key_value_groups
         self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
         if getattr(self.block_config, "petals_custom_cache", False):
-            from petals.models.qwen3_5_moe.block import cache_specs
+            cache_specs = self.block_config.cache_specs
 
             # Budget history/KV tensors plus one recurrent state per block. MemoryCache
             # checks exact allocations when this budget is shared by concurrent sessions.
@@ -742,7 +742,7 @@ def custom_cache_accounting(block_config: PretrainedConfig, block_indices: Seque
     it tests `max_length * 2 * span.length <= cache_tokens_left`, one K/V entry per token, per
     block, per side. Advertising it in any other unit silently breaks unmodified clients.
     """
-    from petals.models.qwen3_5_moe.block import cache_specs
+    cache_specs = block_config.cache_specs
 
     def span_bytes(max_length: int) -> int:
         return sum(

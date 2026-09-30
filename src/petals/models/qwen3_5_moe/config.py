@@ -7,7 +7,7 @@ from transformers import PretrainedConfig
 from petals.client.config import ClientConfig
 from petals.client.lm_head import LMHeadConfig
 from petals.client.ptune import PTuneConfig
-from petals.models.qwen3_5_moe.block import QwenAttention, WrappedQwen3_5MoeBlock
+from petals.models.qwen3_5_moe.block import QwenAttention, WrappedQwen3_5MoeBlock, cache_specs
 
 logger = get_logger(__name__)
 
@@ -34,6 +34,7 @@ class DistributedQwen3_5MoeConfig(PretrainedConfig, ClientConfig, LMHeadConfig, 
     attn_class = QwenAttention
     block_prefix = "model.language_model.layers"
     petals_custom_cache = True
+    cache_specs = staticmethod(cache_specs)
     block_uses_layer_index = True
     keys_to_ignore_at_inference = ["past_key_values"]
 

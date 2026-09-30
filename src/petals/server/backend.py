@@ -106,8 +106,9 @@ class TransformerBackend(ModuleBackend):
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
         if self.custom_cache:
-            from petals.models.qwen3_5_moe.block import cache_specs
-
+            # Each adapter that sets petals_custom_cache carries its own cache_specs, so a
+            # second model with a custom cache cannot be sized by the first one's shapes.
+            cache_specs = self.config.cache_specs
             block = self.module.module_shards[0]
             return [
                 TensorDescriptor(shape, dtype=dtype, device=self.module.devices[0])
