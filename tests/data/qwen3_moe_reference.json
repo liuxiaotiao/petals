@@ -1,0 +1,7 @@
+{
+  "source": "https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+  "sha256": "3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8",
+  "torch_version": "2.14.0+cu130",
+  "dtype": "float32",
+  "seed": 700
+}

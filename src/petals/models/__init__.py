@@ -3,3 +3,4 @@ from petals.models.falcon import *
 from petals.models.llama import *
 from petals.models.mixtral import *
 from petals.models.qwen3_5_moe import *
+from petals.models.qwen3_moe import *

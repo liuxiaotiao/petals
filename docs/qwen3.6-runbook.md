@@ -7,6 +7,9 @@
 
 ---
 
+> 想在同一套机器上跑 Qwen3-30B-A3B(`qwen3_moe`,48 层,全 full attention),
+> 见 [docs/qwen3-30b-a3b.md](qwen3-30b-a3b.md)。流程一样,只是 `MODEL_NAME` 不同。
+
 ## 0. 这套集群的既定事实
 
 写在最前面,因为下面每一步的写法都由它决定:

@@ -1427,7 +1427,10 @@ cmd_plan() {
   fi
   local passthrough=()
   for arg in "$@"; do [[ "$arg" != --force ]] && passthrough+=("$arg"); done
-  python3 examples/plan_blocks.py --state-dir "$STATE_DIR" --hosts-file "$HOSTS_FILE" "${passthrough[@]}"
+  # Pass the model explicitly: layer count, block size and shard geometry all depend on it,
+  # and MODEL_NAME may only be set in this shell rather than exported to the child.
+  python3 examples/plan_blocks.py --state-dir "$STATE_DIR" --hosts-file "$HOSTS_FILE" \
+    --model "$MODEL_NAME" --attn-cache-tokens "${ATTN_CACHE_TOKENS:-65536}" "${passthrough[@]}"
 }
 
 cmd_stop() {
