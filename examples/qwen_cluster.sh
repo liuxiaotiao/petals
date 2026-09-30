@@ -19,6 +19,9 @@
 #   examples/qwen_cluster.sh cleanup --gpu  --yes   # ALSO kill other processes on the GPU
 #   examples/qwen_cluster.sh cleanup --stale --yes  # kill only servers from an earlier
 #                                     # generation that survived a restart and still hold the port
+#   examples/qwen_cluster.sh purge     # dry run: whose cache holds MODEL_NAME, how big
+#   examples/qwen_cluster.sh purge --yes            # delete those weights everywhere
+#   examples/qwen_cluster.sh purge Qwen/Old-Model --yes  # a model you switched away from
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
 #   examples/qwen_cluster.sh service install  # systemd --user units: restart on crash and at boot
 #   examples/qwen_cluster.sh stop      # stop the servers in HOSTS_FILE; leaves the DHT up
@@ -1433,6 +1436,142 @@ cmd_plan() {
     --model "$MODEL_NAME" --attn-cache-tokens "${ATTN_CACHE_TOKENS:-65536}" "${passthrough[@]}"
 }
 
+# Delete one model's downloaded weights from every host's Hub cache.
+#
+# Servers download whole shard files and keep them under MAX_DISK_SPACE, evicting the least
+# recently used ones when they need room. That is the right policy while you serve one model
+# and the wrong one after you switch: the model you left behind still occupies the budget the
+# new one's eviction has to claw back, one shard at a time, mid-download. This removes a repo
+# outright instead.
+#
+#   purge                  dry run for $MODEL_NAME on every host in HOSTS_FILE
+#   purge --yes            actually delete it
+#   purge <repo id>        some other model, e.g. the one you switched away from
+#   purge --all-models     every repo in the cache, not just one
+#   purge --force          include hosts whose server is still running
+#
+# Deleting under a running server is refused by default. Its blocks are already in VRAM so it
+# will not crash, but its next restart or rebalance re-downloads everything it just lost, and
+# on a 15-host swarm that is an hour of nobody serving.
+cmd_purge() {
+  local model="$MODEL_NAME" confirm=0 force=0 all=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) confirm=1 ;;
+      --force) force=1 ;;
+      --all-models) all=1 ;;
+      --*) echo "purge: unknown flag $arg" >&2; return 2 ;;
+      *) model="$arg" ;;
+    esac
+  done
+  (( all )) && model=""
+
+  # Sent base64 so the quoting survives two levels of shell.
+  local purge_b64
+  purge_b64=$(base64 <<'PURGE' | tr -d '\n'
+"""Delete one repo's revisions from this host's Petals cache, or price the deletion.
+
+Goes through huggingface_hub rather than `rm -rf models--Org--Name` so that blobs shared
+with another revision or repo are counted once and kept if something else still needs them,
+and so the number reported is the one the filesystem will actually give back.
+"""
+import fcntl
+import os
+from pathlib import Path
+
+cache = os.environ["QWEN_CACHE_DIR"]
+wanted = os.environ.get("QWEN_PURGE_MODEL") or ""
+apply_it = os.environ.get("QWEN_PURGE_APPLY") == "1"
+
+if not os.path.isdir(cache):
+    print("NO-CACHE bytes=0")
+    raise SystemExit(0)
+
+from huggingface_hub import scan_cache_dir
+
+# The same exclusive lock a server takes before it evicts, so a purge cannot interleave
+# with the LRU eviction of a server that is running anyway under --force.
+lock_path = Path(cache, "blocks.lock")
+with open(lock_path, "wb+") as lock_fd:
+    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+    info = scan_cache_dir(cache)
+    present = sorted(repo.repo_id for repo in info.repos)
+    hits = [repo for repo in info.repos if not wanted or repo.repo_id == wanted]
+    if not hits:
+        print("ABSENT bytes=0 cached=%d have=%s" % (info.size_on_disk, ",".join(present) or "-"))
+        raise SystemExit(0)
+    names = ",".join(sorted(repo.repo_id for repo in hits))
+    plan = info.delete_revisions(*[rev.commit_hash for repo in hits for rev in repo.revisions])
+    freed = plan.expected_freed_size
+    if not apply_it:
+        print("WOULD-DELETE bytes=%d repos=%s cached=%d" % (freed, names, info.size_on_disk))
+        raise SystemExit(0)
+    plan.execute()
+    print("DELETED bytes=%d repos=%s left=%d" % (freed, names, scan_cache_dir(cache).size_on_disk))
+PURGE
+)
+
+  if [[ -n "$model" ]]; then
+    echo "Cached weights for $model on ${#IDS[@]} hosts:"
+  else
+    echo "EVERY cached model on ${#IDS[@]} hosts:"
+  fi
+
+  fanout purge "
+venv_python=\"\$HOME/$REMOTE_DIR/venv/bin/python\"
+if [ ! -x \"\$venv_python\" ]; then echo '{ID} NO-VENV bytes=0 -- never deployed here'; exit 0; fi
+pid=\$(cat \"\$HOME/$REMOTE_DIR/run/server.pid\" 2>/dev/null)
+if [ -n \"\$pid\" ] && kill -0 \"\$pid\" 2>/dev/null && [ '$force' != 1 ]; then
+  echo \"{ID} RUNNING bytes=0 pid=\$pid -- skipped; stop the server or pass --force\"
+  exit 0
+fi
+# Fed on stdin rather than written to a fixed path under /tmp: two purges running at
+# once would otherwise race to create and delete the same file underneath each other.
+out=\$(echo '$purge_b64' | base64 -d | \
+  QWEN_CACHE_DIR=\"\$HOME/$REMOTE_DIR/cache\" QWEN_PURGE_MODEL='$model' QWEN_PURGE_APPLY='$confirm' \
+  \"\$venv_python\" - 2>&1 | tail -3 | tr '\n' ' ') || out=\"ERROR \$out\"
+echo \"{ID} \${out:-ERROR no output}\"
+" || true
+
+  local id bytes file total=0 skipped=0 unreached=0
+  for id in "${IDS[@]}"; do
+    file="$STATE_DIR/out/$id.purge"
+    if [[ ! -s "$file" ]]; then
+      echo "  $id no-response"
+      unreached=$(( unreached + 1 ))
+      continue
+    fi
+    # awk, not grep: under `set -o pipefail` a grep that matches nothing fails the whole
+    # command substitution and errexit kills this function before it prints the total --
+    # which is exactly what happens on the hosts a purge most needs to be loud about.
+    bytes=$(awk 'match($0, /bytes=[0-9]+/) { print substr($0, RSTART + 6, RLENGTH - 6); exit }' "$file")
+    if [[ -z "$bytes" ]]; then
+      echo "  $id UNREACHABLE -- $(head -1 "$file")"
+      unreached=$(( unreached + 1 ))
+      continue
+    fi
+    sed 's/^/  /' "$file"
+    total=$(( total + bytes ))
+    if grep -q ' RUNNING ' "$file"; then skipped=$(( skipped + 1 )); fi
+  done
+
+  local gib; gib=$(awk -v b="$total" 'BEGIN {printf "%.1f", b / 1073741824}')
+  echo
+  if (( confirm )); then
+    echo "Freed $gib GiB across $(( ${#IDS[@]} - unreached )) of ${#IDS[@]} hosts."
+  else
+    echo "Dry run: $gib GiB would be freed. Add --yes to delete."
+  fi
+  if (( skipped )); then
+    echo "$skipped host(s) skipped because a server is running; stop it or pass --force." >&2
+  fi
+  if (( unreached )); then
+    echo "$unreached host(s) did not report; their caches are UNTOUCHED. See $STATE_DIR/out/*.purge." >&2
+    return 1
+  fi
+  return 0
+}
+
 cmd_stop() {
   local with_dht=0
   [[ "${1:-}" == --dht || "${1:-}" == --all ]] && with_dht=1
@@ -1471,6 +1610,7 @@ case "${1:-}" in
   status) shift; cmd_status "$@" ;;
   diag)   shift; cmd_diag "$@" ;;
   cleanup) shift; cmd_cleanup "$@" ;;
+  purge)  shift; cmd_purge "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
   proxy)  shift; cmd_proxy "$@" ;;
   client) shift; cmd_client "$@" ;;

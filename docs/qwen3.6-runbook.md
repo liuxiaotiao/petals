@@ -209,6 +209,7 @@ sudo loginctl enable-linger $(id -un)
 | `status [--watch]` | 每台的进程状态 + 缓存大小 + 下载速率,加上 DHT 里的层覆盖 |
 | `diag` | 没上线时用:进程死活、缓存大小、日志最后一条错误 + 该错误有多旧、bootstrap DHT 状态 |
 | `logs <节点> [行数]` | 看某一台的服务端日志 |
+| `purge [模型] [--yes] [--all-models] [--force]` | 删掉各节点上某个模型下载的权重。默认只报不删;服务端还在跑的节点默认跳过 |
 | `cleanup [--ours\|--gpu\|--stale] [--yes]` | 列出/清理残留进程。默认只列不杀。`--stale` 只杀**上一代**服务端,保留当前那个 |
 | `synctime [--yes]` | 看时钟偏差。全部 NTP 同步时会拒绝 `--yes` |
 | `hosts` | 打印解析出来的节点表 |
@@ -261,6 +262,33 @@ sudo loginctl enable-linger $(id -un)
 **T4 要看一眼。** 16GB 卡放 7 层权重之后余量不多,65536 的预算是 1.76 GiB。
 重启后 `service logs N12` 里如果有 "may grow to ... but ... leave only about ..." 这条
 warning,就把 `ATTN_CACHE_TOKENS` 调小重装。
+
+---
+
+## 4.6 换模型之后清掉旧权重
+
+服务端下载的是整个分片文件,受 `MAX_DISK_SPACE` 约束,满了就按最近最少使用逐个淘汰。
+serve 同一个模型时这个策略是对的;**换模型之后就不对了**——旧模型的分片还占着额度,
+新模型每下一个分片都要先把它挤掉一个,挤在下载过程中间。直接删干净更快:
+
+```bash
+bash examples/qwen_cluster.sh purge                      # 只报不删:哪台有、多大
+bash examples/qwen_cluster.sh purge --yes                # 删掉 $MODEL_NAME
+bash examples/qwen_cluster.sh purge Qwen/Qwen3.6-35B-A3B --yes   # 删掉指定的那个
+bash examples/qwen_cluster.sh purge --all-models --yes   # 清空整个缓存
+```
+
+几个设计上的取舍:
+
+- **默认只报不删**,和 `cleanup` 一样,`--yes` 才真删。
+- **服务端还在跑的节点默认跳过。** 它不会立刻崩(权重已经在显存里),但下一次重启或
+  rebalance 就要重新下载,15 台一起重下差不多一小时没人能服务。确实想删就加 `--force`。
+- **走 `huggingface_hub` 的删除接口,不是 `rm -rf`。** 跟别的 revision 共享的 blob 只算一次,
+  还被别人用着的就留下,报出来的字节数就是文件系统真会还给你的。
+- **删之前拿 `blocks.lock` 排他锁**,就是服务端自己淘汰缓存时拿的那把,所以就算配合
+  `--force` 在跑着的服务端上删,也不会和它的淘汰逻辑交错。
+- **有节点没报上来就退出码 1**,并明说那几台的缓存**没动过**——purge 最怕的就是
+  "以为全删了其实漏了两台"。
 
 ---
 

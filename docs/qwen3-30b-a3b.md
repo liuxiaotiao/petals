@@ -44,6 +44,15 @@ Petals 按参数名精确匹配加载,没有转换步骤,所以适配器保留�
 DHT 前缀带 `-petals-qwen3-moe-v1` 后缀,和 Qwen3.6 的 swarm 天然隔离,
 两个模型可以先后跑、也可以分别用不同的 `HOSTS_FILE` 同时跑在不同机器上。
 
+先把旧模型的权重清掉,否则它会一直占着 `MAX_DISK_SPACE` 的额度,
+新模型每下一个分片都得先挤掉它一个:
+
+```bash
+bash examples/qwen_cluster.sh stop
+bash examples/qwen_cluster.sh purge              # 先看一眼要删多少
+bash examples/qwen_cluster.sh purge --yes
+```
+
 ```bash
 source ~/petals/env.sh
 export MODEL_NAME=Qwen/Qwen3-30B-A3B
