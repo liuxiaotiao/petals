@@ -9,15 +9,14 @@ are shimmed for 4.43.1; attention, normalization, routing and MoE math are upstr
 import ast
 import hashlib
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-from transformers.activations import ACT2FN
-
 from test_qwen3_5_moe import tiny_config
+from transformers.activations import ACT2FN
 
 
 def main():

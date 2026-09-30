@@ -128,3 +128,6 @@ dmypy.json
 .pyre/
 
 .idea/
+
+# isort writes this next to the file it is sorting and renames it into place
+*.isorted

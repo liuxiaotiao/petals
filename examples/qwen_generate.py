@@ -2,8 +2,9 @@
 import argparse
 
 import torch
-from petals import AutoDistributedModelForCausalLM  # Registers the backported Qwen config/tokenizer.
 from transformers import AutoTokenizer
+
+from petals import AutoDistributedModelForCausalLM  # Registers the backported Qwen config/tokenizer.
 
 
 def main():
