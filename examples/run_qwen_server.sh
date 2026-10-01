@@ -54,4 +54,11 @@ if [[ -n "${MODEL_REVISION:-}" ]]; then args+=(--revision "$MODEL_REVISION"); fi
 # Required whenever peers are not on one flat network: the address others must dial.
 if [[ -n "${ANNOUNCE_IP:-}" ]]; then args+=(--public_ip "$ANNOUNCE_IP"); fi
 
+# Hugging Face routes downloads through Xet unless told otherwise, and a server that
+# cannot reach cas-server.xethub.hf.co spends its whole life retrying it instead of
+# downloading -- with a cache frozen at a few kilobytes as the only symptom. The control
+# node is supposed to pass this in, but a shell that forgot to source its env file would
+# silently re-enable Xet, so the floor lives here. Set HF_HUB_DISABLE_XET=0 to opt back in.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+
 exec "$python_bin" -m petals.cli.run_server "${args[@]}"

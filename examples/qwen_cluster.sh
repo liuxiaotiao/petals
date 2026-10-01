@@ -65,6 +65,10 @@ MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
 # files (14 layers would need up to 30.5 GB), so 30GB leaves room without letting rebalancing
 # grow the cache without bound. Petals evicts least-recently-used shards to stay under it.
 MAX_DISK_SPACE="${MAX_DISK_SPACE:-30GB}"
+# A time daemon that has not heard from its source in this long is free-running. chrony
+# keeps reporting a sub-millisecond offset against a reference it last reached weeks ago,
+# which is true and useless. Default chrony polls at least every 1024s, so an hour is slack.
+NTP_REF_MAX_AGE="${NTP_REF_MAX_AGE:-3600}"
 # NODE_PY: an interpreter that already exists on every host (e.g. a conda env with torch).
 # The venv is then built on top of it with --system-site-packages, so torch is inherited
 # and Petals' own pins (transformers==4.43.1, numpy<2, peft, bitsandbytes) land in the venv
@@ -134,6 +138,27 @@ remote() {  # remote <ip> <shell-command>
 
 # Run one command on every host at once; report which hosts failed.
 # Print nothing when MODEL_NAME was set on purpose; speak up when it was not.
+# The variables that change what the servers do and say nothing when they are missing.
+# An unset HF_HUB_DISABLE_XET aims every download at a backend this cluster cannot reach;
+# an unset NODE_PY builds the venv from a different interpreter. One line beats an hour.
+human_age() {  # human_age <seconds>
+  local s="$1"
+  if   (( s < 120 ));   then echo "${s}s"
+  elif (( s < 7200 ));  then echo "$(( s / 60 ))m"
+  elif (( s < 172800 ));then echo "$(( s / 3600 ))h"
+  else                       echo "$(( s / 86400 ))d"; fi
+}
+
+announce_environment() {
+  local name value out=()
+  for name in MODEL_NAME NODE_PY HF_HUB_DISABLE_XET HF_ENDPOINT MAX_DISK_SPACE \
+              ATTN_CACHE_TOKENS INFERENCE_MAX_LENGTH; do
+    value="${!name:-}"
+    out+=("$name=${value:-(unset)}")
+  done
+  printf 'Environment: %s\n' "${out[*]}"
+}
+
 announce_model() {
   [[ "$MODEL_NAME_SOURCE" == default ]] || return 0
   echo "MODEL_NAME is not set, so this run uses the built-in default $MODEL_NAME." >&2
@@ -177,13 +202,16 @@ fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
 SKEWS=()
 SKEW_SRC=()
 SKEW_ERR=()
+SKEW_STALE=()     # seconds since that daemon last heard from its source, empty if current
+SKEW_RTT=()       # the round-trip estimate, kept even when the daemons are believed
+SKEW_RTT_ERR=()
 measure_skew() {
-  local i ntp=() rtt=() err=() src=()
+  local i ntp=() rtt=() err=() src=() stale=()
   for i in "${!IDS[@]}"; do
-    local t0 t1 out epoch offset
+    local t0 t1 out epoch offset refline refepoch refage staleage
     t0=$(date +%s.%N)
     # No $ or quotes in this command: it is passed through two shells before it runs.
-    out=$(remote "${IPS[$i]}" 'date +%s.%N; command -v chronyc >/dev/null 2>&1 && chronyc tracking 2>/dev/null | grep -E "^(Leap status|System time)"' 2>/dev/null || echo "")
+    out=$(remote "${IPS[$i]}" 'date +%s.%N; command -v chronyc >/dev/null 2>&1 && chronyc tracking 2>/dev/null | grep -E "^(Leap status|System time|Ref time)"' 2>/dev/null || echo "")
     t1=$(date +%s.%N)
     epoch=$(printf '%s\n' "$out" | head -1)
     # "System time : 0.000000029 seconds slow of NTP time" -> the clock is that far behind
@@ -192,6 +220,21 @@ measure_skew() {
       /^Leap status/ { leap = $4 }
       /^System time/ { mag = $4; dir = $6 }
       END { if (leap == "Normal" && mag != "") printf "%s%s", (dir == "fast" ? "+" : "-"), mag }')
+    # "Ref time (UTC) : Thu Oct 01 13:42:35 2026" -- when the source was last heard from,
+    # not when the daemon last recomputed. A daemon whose source went away keeps reporting
+    # a sub-millisecond System time offset while the clock drifts, so this is the field
+    # that says whether the offset above still means anything. One host here had been
+    # free-running for 44 days and still read as perfect.
+    refage=""; staleage=""
+    refline=$(printf '%s\n' "$out" | sed -n 's/^Ref time[^:]*:[[:space:]]*//p' | head -1)
+    if [[ -n "$refline" ]]; then
+      refepoch=$(date -u -d "$refline" +%s 2>/dev/null || true)
+      [[ -n "${refepoch:-}" ]] && refage=$(awk -v n="$t1" -v r="$refepoch" 'BEGIN {printf "%d", n - r}')
+    fi
+    if [[ -n "$offset" && -n "$refage" ]] && (( refage > NTP_REF_MAX_AGE )); then
+      staleage="$refage"; offset=""   # free-running: fall back to timing it ourselves
+    fi
+    stale+=("$staleage")
     if [[ -z "$epoch" ]]; then
       ntp+=("nan"); rtt+=("nan"); err+=("nan"); src+=("unreachable")
       continue
@@ -204,8 +247,16 @@ measure_skew() {
 
   local bi
   bi=$(find_index "$BOOTSTRAP_NODE") || bi=0   # subset file: any host serves as the reference
-  SKEWS=(); SKEW_SRC=(); SKEW_ERR=()
+  SKEWS=(); SKEW_SRC=(); SKEW_ERR=(); SKEW_STALE=("${stale[@]}"); SKEW_RTT=(); SKEW_RTT_ERR=()
   for i in "${!IDS[@]}"; do
+    # Keep the round-trip figure for every host even when its daemon is believed: it is the
+    # only reading that compares hosts to each other rather than each to its own source.
+    if [[ "${src[$i]}" == unreachable || "${src[$bi]}" == unreachable ]]; then
+      SKEW_RTT+=("nan"); SKEW_RTT_ERR+=("nan")
+    else
+      SKEW_RTT+=("$(awk -v x="${rtt[$i]}" -v y="${rtt[$bi]}" 'BEGIN {printf "%+.1f", x - y}')")
+      SKEW_RTT_ERR+=("$(awk -v x="${err[$i]}" -v y="${err[$bi]}" 'BEGIN {printf "%.2f", x + y}')")
+    fi
     # Daemon offsets are in the true-time frame and round-trip estimates are in the control
     # node's frame; the two cannot be subtracted from each other, so a pair falls back to
     # the round-trip frame unless BOTH ends read their own daemon.
@@ -236,21 +287,54 @@ cmd_synctime() {
   measure_skew
   local i bi
   bi=$(find_index "$BOOTSTRAP_NODE") || bi=0
-  local synced=0 known=0
-  printf '%-5s %-16s %-12s %s\n' NODE ADDRESS "skew vs $BOOTSTRAP_NODE" measured-by
+  local synced=0 known=0 stale_hosts=() disagree=()
+  local refnode="${IDS[$bi]}"   # with a subset hosts file this is not BOOTSTRAP_NODE
+  printf '%-5s %-16s %-12s %s\n' NODE ADDRESS "skew vs $refnode" measured-by
   for i in "${!IDS[@]}"; do
     local note="${SKEW_SRC[$i]}"
     [[ "$note" == rtt ]] && note="rtt (+-${SKEW_ERR[$i]}s)"
     [[ "$note" == ntp ]] && note="its own NTP daemon"
+    if [[ -n "${SKEW_STALE[$i]}" ]]; then
+      note="$note -- NTP daemon last reached its source $(human_age "${SKEW_STALE[$i]}") ago"
+      stale_hosts+=("${IDS[$i]} ($(human_age "${SKEW_STALE[$i]}"))")
+    fi
     printf '%-5s %-16s %-12s %s\n' "${IDS[$i]}" "${IPS[$i]}" "${SKEWS[$i]}s" "$note"
     [[ "${SKEW_SRC[$i]}" == ntp ]] && synced=$((synced + 1))
     [[ "${SKEW_SRC[$i]}" != unreachable ]] && known=$((known + 1))
   done
 
+  # Two hosts can each be perfectly synchronised and still be seconds apart, because they
+  # are synchronised to sources that disagree. No daemon can see that about another host;
+  # only their wall clocks can. The round-trip figure is coarse, so only call it a
+  # disagreement when it clears its own error bar by a wide margin.
+  for i in "${!IDS[@]}"; do
+    [[ "${SKEW_SRC[$i]}" == ntp ]] || continue
+    [[ "${SKEW_RTT[$i]}" == *nan* ]] && continue
+    if awk -v r="${SKEW_RTT[$i]}" -v e="${SKEW_RTT_ERR[$i]}" \
+           'BEGIN { exit !((r < 0 ? -r : r) > e + 2) }'; then
+      disagree+=("${IDS[$i]} reads ${SKEW_RTT[$i]}s against $refnode")
+    fi
+  done
+
   echo
-  if (( synced == known && known > 0 )); then
-    echo "Every host is disciplined by a running NTP daemon, so these offsets are read from"
-    echo "the daemons and are accurate to milliseconds. There is nothing to step."
+  if (( ${#stale_hosts[@]} )); then
+    echo "Not actually disciplined, whatever their daemons report: ${stale_hosts[*]}." >&2
+    echo "Their offsets above were timed over SSH instead. Fix the source on those hosts" >&2
+    echo "('chronyc sources -v', then restart the daemon); stepping will only drift again." >&2
+    echo
+  fi
+  if (( ${#disagree[@]} )); then
+    echo "WARNING: every daemon below reports itself synchronised, yet the hosts do not" >&2
+    echo "agree with each other on the wall clock:" >&2
+    printf '  %s\n' "${disagree[@]}" >&2
+    echo "That is what synchronising to sources that disagree looks like -- each host is" >&2
+    echo "correct about its own reference. Compare 'chronyc tracking' Ref time and" >&2
+    echo "'chronyc sources' across them. Stepping the clocks will not fix it." >&2
+    echo
+  fi
+  if (( synced == known && known > 0 && ${#disagree[@]} == 0 )); then
+    echo "Every host is disciplined by a running NTP daemon and they agree with each other,"
+    echo "so these offsets are accurate to milliseconds. There is nothing to step."
     if (( confirm && ! force )); then
       echo
       echo "Refusing --yes: stepping a clock out from under chrony makes things worse, not" >&2
@@ -259,6 +343,11 @@ cmd_synctime() {
       return 1
     fi
     (( confirm )) || return 0
+  elif (( synced == known && known > 0 )); then
+    echo "Every daemon claims to be synchronised, so there is nothing here to step; the"
+    echo "disagreement above is between their sources, not inside any one host."
+    (( confirm )) || return 0
+    return 1
   elif (( synced )); then
     echo "$synced of $known host(s) read their offset from a running NTP daemon (millisecond"
     echo "accuracy); the rest are timed over SSH, where +-a second or two is measurement noise."
@@ -269,13 +358,13 @@ cmd_synctime() {
 
   if (( ! confirm )); then
     echo
-    echo "Dry run. 'synctime --yes' steps each host's clock to $BOOTSTRAP_NODE's."
+    echo "Dry run. 'synctime --yes' steps each host's clock to $refnode's."
     echo "Needs passwordless sudo. Fix the NTP source too -- this does not stop the drift."
     return 0
   fi
 
   echo
-  echo "Stepping clocks to $BOOTSTRAP_NODE ..."
+  echo "Stepping clocks to $refnode ..."
   for i in "${!IDS[@]}"; do
     [[ "$i" == "$bi" ]] && continue
     # Re-read the reference per host: the loop itself takes time.
@@ -565,6 +654,7 @@ venv/bin/python -c 'import petals, torch; print(\"{ID}\", petals.__version__, to
 
 cmd_start() {
   mkdir -p "$STATE_DIR/out"
+  announce_environment
   ensure_proxy_addr
   local restart=0
   [[ "${1:-}" == --restart ]] && restart=1
@@ -1213,6 +1303,8 @@ cmd_service() {
         echo "No bootstrap address; run 'start' once before installing units." >&2; exit 1
       }
       local bnode_idx=""; bnode_idx=$(find_index "$BOOTSTRAP_NODE") || true
+      # These values are about to be frozen into every host's env file, so name them first.
+      announce_environment
       ensure_proxy_addr
       # The env files are written once and then used on every restart, so a proxy missing
       # here is baked into the units until someone reinstalls them.
