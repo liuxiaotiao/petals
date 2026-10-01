@@ -7,6 +7,23 @@ from transformers import AutoTokenizer
 from petals import AutoDistributedModelForCausalLM  # Registers the backported Qwen config/tokenizer.
 
 
+def load_tokenizer(model, revision):
+    """Load the tokenizer, falling back to the slow one when the fast parser refuses.
+
+    Qwen3's tokenizer.json is written by a newer `tokenizers` than this fork's pinned
+    Transformers 4.43.1 permits (>=0.19,<0.20); the old Rust deserializer rejects it with
+    "data did not match any variant of untagged enum ModelWrapper". The Hub repo also ships
+    vocab.json and merges.txt, so the pure-Python BPE loads the same vocabulary without that
+    parser. Encoding a prompt costs milliseconds against hundreds per generated token, so the
+    slow path is not worth engineering around.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(model, revision=revision)
+    except Exception as error:
+        print(f"fast tokenizer unavailable ({type(error).__name__}), using the slow one", flush=True)
+        return AutoTokenizer.from_pretrained(model, revision=revision, use_fast=False)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--initial-peers", nargs="+", required=True)
@@ -17,7 +34,7 @@ def main():
     parser.add_argument("--prompt", default="请用中文简单介绍一下你自己。")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    tokenizer = load_tokenizer(args.model, args.revision)
     # FP32 avoids slow CPU BF16 emulation. Only embeddings, norm and LM head are loaded locally.
     model = AutoDistributedModelForCausalLM.from_pretrained(
         args.model,

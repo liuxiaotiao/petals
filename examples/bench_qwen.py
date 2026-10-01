@@ -182,6 +182,23 @@ def summarize(out, wall, concurrency):
     }
 
 
+def load_tokenizer(model, revision):
+    """Load the tokenizer, falling back to the slow one when the fast parser refuses.
+
+    Qwen3's tokenizer.json is written by a newer `tokenizers` than this fork's pinned
+    Transformers 4.43.1 permits (>=0.19,<0.20); the old Rust deserializer rejects it with
+    "data did not match any variant of untagged enum ModelWrapper". The Hub repo also ships
+    vocab.json and merges.txt, so the pure-Python BPE loads the same vocabulary without that
+    parser. Encoding a prompt costs milliseconds against hundreds per generated token, so the
+    slow path is not worth engineering around.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(model, revision=revision)
+    except Exception as error:
+        say(f"fast tokenizer unavailable ({type(error).__name__}), using the slow one")
+        return AutoTokenizer.from_pretrained(model, revision=revision, use_fast=False)
+
+
 def build_prompt(tokenizer, length):
     """Real text, not random ids: a random id can be a special token, and a stray EOS would end
     generation early and quietly halve the sample."""
@@ -225,7 +242,7 @@ def main():
     logging.getLogger().addHandler(recorder)
 
     say("loading tokenizer and the client-side layers ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    tokenizer = load_tokenizer(args.model, args.revision)
     model = AutoDistributedModelForCausalLM.from_pretrained(
         args.model,
         initial_peers=args.initial_peers,
