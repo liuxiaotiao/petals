@@ -55,6 +55,11 @@ CLIENT_NODE="${CLIENT_NODE:-$PROXY_NODE}"  # the node the client runs on
 PROXY_ALLOW="${PROXY_ALLOW:-}"          # client IPs; empty means every host in HOSTS_FILE
 PROXY_PORTS="${PROXY_PORTS:-80,443}"    # destination ports the proxy will open
 DHT_PORT="${DHT_PORT:-31337}"
+# Which model this run is about is the one setting that silently picks the wrong answer:
+# unset, every command below quietly addresses the previous model -- a different DHT prefix,
+# a different cache, a different set of weights to download. Remember where the value came
+# from so announce_model() can say so.
+if [[ -n "${MODEL_NAME:-}" ]]; then MODEL_NAME_SOURCE=environment; else MODEL_NAME_SOURCE=default; fi
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
 # Hub cache ceiling per host. A contiguous 11-layer range needs at most 25.5 GB of shard
 # files (14 layers would need up to 30.5 GB), so 30GB leaves room without letting rebalancing
@@ -128,6 +133,13 @@ remote() {  # remote <ip> <shell-command>
 }
 
 # Run one command on every host at once; report which hosts failed.
+# Print nothing when MODEL_NAME was set on purpose; speak up when it was not.
+announce_model() {
+  [[ "$MODEL_NAME_SOURCE" == default ]] || return 0
+  echo "MODEL_NAME is not set, so this run uses the built-in default $MODEL_NAME." >&2
+  echo "  Source your env file, or export MODEL_NAME, if you meant a different model." >&2
+}
+
 fanout() {  # fanout <label> <command-template with {ID} {IP} {PORT}>
   local label="$1" template="$2" i pids=() rc=0
   mkdir -p "$STATE_DIR/out"
@@ -635,6 +647,7 @@ echo '{ID} cleared'
     echo "Hub access: ${#routed[@]} host(s) via $addr; the rest use their own egress."
   else
     echo "Hub access: no proxy registered, every host will use its own egress."
+    [[ -n "$PROXY_ABSENT_REASON" ]] && echo "  Reason: $PROXY_ABSENT_REASON." >&2
     echo "  If some hosts have none, run 'proxy start' first or they will retry forever." >&2
   fi
 
@@ -926,7 +939,17 @@ echo '{ID} done'
   (( shown )) || { echo "  nothing running on any host"; return 0; }
   echo
   if (( confirm )); then
-    echo "Killed the processes listed above (OURS$( ((want_gpu)) && echo " and OTHER" ))."
+    # Only the tags that were actually asked for get killed: `cleanup --gpu --yes` lists
+    # OURS for context and leaves it running. Saying otherwise once had this script claim
+    # it had killed a bootstrap DHT that was in fact untouched.
+    local killed=()
+    (( want_ours )) && killed+=(OURS)
+    (( want_gpu )) && killed+=(OTHER)
+    if (( ${#killed[@]} )); then
+      echo "Killed: ${killed[*]}. Processes above with any other tag were listed, not touched."
+    else
+      echo "Nothing was killed: --yes needs --ours or --gpu to say what it may kill."
+    fi
   else
     echo "Dry run -- nothing was killed. To act:"
     echo "  cleanup --ours --yes   # only this deployment's own leftovers"
@@ -961,14 +984,25 @@ proxy_addr() {
 # The cached address is a convenience, not the truth. Losing the file silently switched the
 # proxy off for twelve hosts and read as a network outage; ask the proxy node instead. Done
 # once per command rather than per host, so it costs one round trip, not fifteen.
+# Why proxy_addr came back empty, for whoever has to act on it. "No proxy" reads as a
+# statement of fact; "PROXY_NODE is not in this hosts file" reads as the mistake it usually is.
+PROXY_ABSENT_REASON=""
 ensure_proxy_addr() {
+  PROXY_ABSENT_REASON=""
   [[ -f "$STATE_DIR/proxy_addr" ]] && return 0
-  local i; i=$(find_index "$PROXY_NODE") || return 0
+  local i
+  if ! i=$(find_index "$PROXY_NODE"); then
+    PROXY_ABSENT_REASON="PROXY_NODE=$PROXY_NODE is not in $HOSTS_FILE, so its address cannot be looked up"
+    return 0
+  fi
   local alive
   alive=$(remote "${IPS[$i]}" \
     "[ -f '$REMOTE_DIR/run/proxy.pid' ] && kill -0 \$(cat '$REMOTE_DIR/run/proxy.pid') 2>/dev/null && echo yes" \
     2>/dev/null || true)
-  [[ "$alive" == yes ]] || return 0
+  if [[ "$alive" != yes ]]; then
+    PROXY_ABSENT_REASON="no proxy process is running on $PROXY_NODE"
+    return 0
+  fi
   mkdir -p "$STATE_DIR"
   printf 'http://%s:%s\n' "${IPS[$i]}" "$PROXY_PORT" > "$STATE_DIR/proxy_addr"
   echo "Recovered the proxy address from $PROXY_NODE: http://${IPS[$i]}:$PROXY_PORT"
@@ -1600,6 +1634,9 @@ if [ -f run/dht.pid ]; then kill \$(cat run/dht.pid) 2>/dev/null || true; rm -f 
 " || true
   echo "Stopped. The bootstrap identity is kept, so 'start' reuses the same peer address."
 }
+
+# 'hosts' only parses the hosts file; everything else acts on one specific model.
+[[ "${1:-}" == hosts ]] || announce_model
 
 case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
