@@ -268,6 +268,44 @@ Using DHT prefix: Qwen3-6-35B-A3B-petals-qwen-v1
 
 ---
 
+## 6. 磁盘:换框架或换模型之后的清理
+
+2026-10-02 这 15 台的根分区只剩 1.7–3.4 GB,一次 rsync 就 `No space left on device`,
+而 Petals 自己占的是该占的那份。大头全在没人认领的缓存里:
+
+| 占用 | 每台 | 性质 |
+|---|---|---|
+| `~/.cache/pip` | 13 GB | 下载缓存,删了无害 |
+| `Anaconda3-*.sh` | 659 MB | 装完没删的安装包 |
+| `~/.cache/huggingface` | 4.8–11 GB | **客户端**拉的模型分片 |
+| `~/petals-qwen/cache` | 29–32 GB | server 的块权重,归 `purge` 管 |
+
+客户端缓存是个盲区:`cmd_client` 不设 `CACHE_DIR`,它落在默认的
+`~/.cache/huggingface`,于是既不计入 `MAX_DISK_SPACE`,`status` 看不到,
+`purge` 也清不掉。N03 就这样一直留着 5.9 GB 的 Qwen3.6 客户端缓存,
+换模型两周后才被发现。
+
+`examples/cluster_disk.sh` 专门管这一类。它不依赖 Petals,换别的框架压测时照用:
+
+```bash
+examples/cluster_disk.sh survey                       # 只看不删,全部目标
+examples/cluster_disk.sh clean pip installers         # 空跑
+examples/cluster_disk.sh clean pip installers --yes
+KEEP="Qwen/Qwen3-30B-A3B" examples/cluster_disk.sh clean hf --yes
+examples/cluster_disk.sh survey --host N03            # 单台
+```
+
+目标:`pip` `conda` `torch` `hf` `hfdata` `installers`,全是缓存或安装包,
+删掉的代价只是重新下载,不是状态。和 `purge` 同样的形状:默认空跑,
+`--yes` 才动手,一台连不上不影响其余的,结尾单独列出没清到的主机。
+
+**它碰不到 `~/petals-qwen/cache`。** 那是 server 的块权重,必须走 `purge`,
+而 `purge` 知道在 server 还活着的时候拒绝执行。
+
+那次清理一共腾出约 190 GB,15 台全部回到 17 GB 以上。
+
+---
+
 ## 不支持的
 
 配置里出现这些会在启动时直接报错,而不是跑出错结果:
