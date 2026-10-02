@@ -16,6 +16,7 @@ one-token run and an N-token one.
 import argparse
 import logging
 import math
+import multiprocessing
 import os
 import statistics
 import threading
@@ -33,6 +34,25 @@ def say(*parts, end="\n"):
     """Print and flush. Over ssh stdout is a pipe, so block buffering makes a slow run look
     identical to a hung one until it finally exits."""
     print(*parts, end=end, flush=True)
+
+
+def hard_exit(code):
+    """Leave without joining our own threads, but take the child processes with us.
+
+    os._exit skips multiprocessing's atexit hook, so hivemind's DHT process would outlive
+    this one still holding the stdout it inherited -- and ssh does not close the session
+    until every holder of that pipe is gone. The table would print and the command would
+    never return, which looks exactly like a hung benchmark from the control node.
+    Joining our own threads is still not an option: they may be mid-RPC.
+    """
+    children = multiprocessing.active_children()
+    for child in children:
+        child.terminate()
+    for child in children:
+        child.join(2)
+        if child.is_alive():
+            child.kill()
+    os._exit(code)
 
 
 class RouteRecorder(logging.Handler):
@@ -96,7 +116,7 @@ def arm_watchdog(seconds):
 
     def fire():
         say(f"\nTIMED OUT after {seconds:.0f}s with no result; exiting.")
-        os._exit(3)
+        hard_exit(3)
 
     timer = threading.Timer(seconds, fire)
     timer.daemon = True
@@ -305,4 +325,4 @@ def main():
 
 
 if __name__ == "__main__":
-    os._exit(main() or 0)  # threads may be mid-RPC; do not wait on them to exit
+    hard_exit(main() or 0)
