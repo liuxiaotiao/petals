@@ -1249,6 +1249,7 @@ cmd_client() {
 cd '$REMOTE_DIR/repo'
 HF_HUB_DISABLE_XET='${HF_HUB_DISABLE_XET:-1}' \
 PETALS_MAX_RETRIES='${PETALS_MAX_RETRIES:-3}' \
+PETALS_INFERENCE_ROUTING='${PETALS_INFERENCE_ROUTING:-min_latency}' \
 $(proxy_env_for "$node")\
 "\$HOME/$REMOTE_DIR/venv/bin/python" -u examples/$CLIENT_SCRIPT \
   --initial-peers '$peer' --model '$MODEL_NAME'${MODEL_REVISION:+ --revision '$MODEL_REVISION'}$args

@@ -275,6 +275,7 @@ def main():
 
     say(f"\nmodel {args.model}  servers float16, client-side layers {args.torch_dtype}")
     say(f"prompt {prompt_ids.shape[1]} tokens, {args.new_tokens} generated per session")
+    say(f"inference routing: {os.environ.get('PETALS_INFERENCE_ROUTING', 'min_latency')}")
     say(f"per-level timeout {args.timeout:.0f}s, single session on {'this' if args.inline else 'a worker'} thread\n")
 
     for _ in range(args.warmup):

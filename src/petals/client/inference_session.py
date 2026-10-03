@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import time
 import uuid
 from typing import AsyncIterator, List, Optional, Tuple
@@ -21,6 +22,18 @@ from petals.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from petals.utils.packaging import pack_args_kwargs
 
 logger = get_logger(__name__)
+
+# How a session picks one server per span. Upstream always uses "min_latency": a shortest
+# path over advertised throughput, so every client computes the same route and each span's
+# fastest replica takes all of the load while its other replicas idle. Measured on a
+# 15-server swarm: three spans with 2-4 replicas each sent 100% of sessions to one of them.
+# "max_throughput" is the policy upstream already uses for training -- replicas chosen at
+# random, weighted by span length -- and spreads sessions across them instead.
+INFERENCE_ROUTING = os.environ.get("PETALS_INFERENCE_ROUTING", "min_latency")
+if INFERENCE_ROUTING not in ("min_latency", "max_throughput"):
+    raise ValueError(
+        f"PETALS_INFERENCE_ROUTING={INFERENCE_ROUTING!r}; expected 'min_latency' or 'max_throughput'"
+    )
 
 
 class _ServerInferenceSession:
@@ -374,7 +387,7 @@ class InferenceSession:
             )
 
         updated_spans = self._sequence_manager.make_sequence(
-            block_idx, update_end, mode="min_latency", cache_tokens_needed=self._max_length
+            block_idx, update_end, mode=INFERENCE_ROUTING, cache_tokens_needed=self._max_length
         )
         # make_sequence() could return a longer sequence
         updated_spans[-1].end = min(updated_spans[-1].end, update_end)
