@@ -23,6 +23,7 @@
 #   examples/qwen_cluster.sh purge --yes            # delete those weights everywhere
 #   examples/qwen_cluster.sh purge Qwen/Old-Model --yes  # a model you switched away from
 #   examples/qwen_cluster.sh logs N07  # tail one host's server log
+#   examples/qwen_cluster.sh peers     # NODE PEER_ID SPAN, for bench --allowed-servers
 #   examples/qwen_cluster.sh service install  # systemd --user units: restart on crash and at boot
 #   examples/qwen_cluster.sh stop      # stop the servers in HOSTS_FILE; leaves the DHT up
 #   examples/qwen_cluster.sh stop --dht  # also stop the bootstrap DHT (takes the whole swarm down)
@@ -1047,6 +1048,31 @@ echo '{ID} done'
   fi
 }
 
+# Each host's current peer id and layer span, one line per host: NODE PEER_ID START:END.
+#
+# 'bench --allowed-servers' needs full peer ids to pin a client to one explicit chain, and
+# 'status' only shows their last six characters. Ids are minted fresh on every server
+# start, so this reads the newest one each host logged; a list taken before a restart is
+# stale after it.
+cmd_peers() {
+  local b64 i out
+  b64=$(base64 <<'PEERS' | tr -d '\n'
+f="$HOME/$RD/logs/server.log"
+peer=$(grep -ao 'Running a server on .*' "$f" 2>/dev/null | tail -1 | grep -ao '/p2p/[A-Za-z0-9]*' | head -1 | cut -d/ -f3)
+line=$(grep -a 'are joining' "$f" 2>/dev/null | tail -1)
+case "$line" in
+  *range\(*) span=$(echo "$line" | sed -E 's/.*range\(([0-9]+), ([0-9]+)\).*/\1:\2/') ;;
+  *)         span=$(echo "$line" | grep -o '\[[0-9, ]*\]' | tr -d '[] ' | awk -F, '{print $1 ":" $NF+1}') ;;
+esac
+echo "${peer:--} ${span:--}"
+PEERS
+)
+  for i in "${!IDS[@]}"; do
+    out=$(remote "${IPS[$i]}" "echo '$b64' | base64 -d | RD='$REMOTE_DIR' bash" 2>/dev/null) || out="- unreachable"
+    printf '%-5s %s\n' "${IDS[$i]}" "$out"
+  done
+}
+
 cmd_logs() {
   local id="${1:?usage: logs <node-id> [lines]}" lines="${2:-60}"
   local i; i=$(index_of "$id")
@@ -1742,6 +1768,7 @@ case "${1:-}" in
   cleanup) shift; cmd_cleanup "$@" ;;
   purge)  shift; cmd_purge "$@" ;;
   logs)   shift; cmd_logs "$@" ;;
+  peers)  shift; cmd_peers "$@" ;;
   proxy)  shift; cmd_proxy "$@" ;;
   client) shift; cmd_client "$@" ;;
   bench)  shift; CLIENT_SCRIPT=bench_qwen.py; cmd_client "$@" ;;

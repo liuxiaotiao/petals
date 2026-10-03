@@ -234,6 +234,13 @@ def main():
     parser.add_argument("--initial-peers", nargs="+", required=True)
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B")
     parser.add_argument("--revision", default=None)
+    parser.add_argument(
+        "--allowed-servers",
+        nargs="+",
+        default=None,
+        metavar="PEER_ID",
+        help="route only through these peers (one full chain), e.g. from 'qwen_cluster.sh peers'",
+    )
     parser.add_argument("--dht-prefix", default=None)
     # float32, not the servers' float16. Only the embeddings, the final norm and the LM
     # head run here, on CPU, and CPU fp16 is emulated in software -- the LM head alone is
@@ -270,12 +277,15 @@ def main():
         dht_prefix=args.dht_prefix,
         torch_dtype=DTYPES[args.torch_dtype],
         max_retries=3,  # the default behaves as unlimited, which hides a failure as a hang
+        allowed_servers=args.allowed_servers,
     )
     prompt_ids = build_prompt(tokenizer, args.prompt_tokens)
 
     say(f"\nmodel {args.model}  servers float16, client-side layers {args.torch_dtype}")
     say(f"prompt {prompt_ids.shape[1]} tokens, {args.new_tokens} generated per session")
     say(f"inference routing: {os.environ.get('PETALS_INFERENCE_ROUTING', 'min_latency')}")
+    if args.allowed_servers:
+        say(f"allowed servers: {' '.join('…' + peer[-6:] for peer in args.allowed_servers)}")
     say(f"per-level timeout {args.timeout:.0f}s, single session on {'this' if args.inline else 'a worker'} thread\n")
 
     for _ in range(args.warmup):
