@@ -2,10 +2,13 @@
 
   python3 examples/workload_sample.py --out task/workload/prompts.jsonl
   python3 examples/workload_sample.py --per-dataset 50 --datasets gsm8k mbpp lmsys --seed 0
+  python3 examples/workload_sample.py --datasets lmsys --keep   # redo one, keep the others
 
 Standard library only, so it runs on the control node or on any host with Hub access.
-Rows come from the Hugging Face dataset viewer API, one random offset at a time, so nothing
-large is downloaded: lmsys-chat-1m alone is a million conversations.
+Rows come from the Hugging Face dataset viewer API, so nothing large is downloaded. Small
+splits (gsm8k, mbpp) are read whole in pages of 100 and sampled locally; lmsys-chat-1m, a
+million conversations, is sampled one random row per request. Requests are paced
+(--pause) and 429s wait as long as the API asks, because it does rate-limit.
 
 lmsys/lmsys-chat-1m is gated. Accept its license on the Hub with the account whose token
 is in HF_TOKEN, or leave it out with --datasets gsm8k mbpp. A dataset that fails is
@@ -28,24 +31,47 @@ import urllib.request
 API = "https://datasets-server.huggingface.co/rows"
 
 
-def fetch_row(dataset, config, split, offset, token, attempts=5):
-    query = urllib.parse.urlencode(dict(dataset=dataset, config=config, split=split, offset=offset, length=1))
-    request = urllib.request.Request(f"{API}?{query}")
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
-    for attempt in range(attempts):
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as error:
-            if error.code in (401, 403, 404):
-                raise  # access problems do not get better by retrying
-            if attempt + 1 == attempts:
-                raise
-        except (urllib.error.URLError, TimeoutError):
-            if attempt + 1 == attempts:
-                raise
-        time.sleep(2**attempt)  # 429 / 5xx / transient network
+class Fetcher:
+    """Viewer API pages, paced, with 429 handled the way the API asks.
+
+    The API rate-limits per client: drawing ~50 rows back to back was enough to get 429 on
+    the second dataset. So every request waits --pause after the previous one, and a 429
+    waits for Retry-After (or a backoff up to a minute) instead of giving up after 15 s.
+    """
+
+    def __init__(self, token, pause, attempts=8):
+        self.token, self.pause, self.attempts, self.last = token, pause, attempts, 0.0
+
+    def __call__(self, dataset, config, split, offset, length=1):
+        query = urllib.parse.urlencode(dict(dataset=dataset, config=config, split=split, offset=offset, length=length))
+        request = urllib.request.Request(f"{API}?{query}")
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+        for attempt in range(self.attempts):
+            time.sleep(max(0.0, self.last + self.pause - time.monotonic()))
+            self.last = time.monotonic()
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as error:
+                if error.code not in (429, 500, 502, 503, 504) or attempt + 1 == self.attempts:
+                    raise  # 401/403/404 are access problems: retrying does not help
+                wait = retry_after(error) or min(60, 4 * 2**attempt)
+                reason = f"HTTP {error.code}"
+            except (urllib.error.URLError, TimeoutError) as error:
+                if attempt + 1 == self.attempts:
+                    raise
+                wait, reason = min(60, 4 * 2**attempt), type(error).__name__
+            print(f"\n  {dataset}: {reason}, waiting {wait:.0f}s ({attempt + 1}/{self.attempts - 1})",
+                  file=sys.stderr, flush=True)
+            time.sleep(wait)
+
+
+def retry_after(error):
+    try:
+        return min(300, float(error.headers.get("Retry-After")))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def gsm8k(row):
@@ -85,10 +111,40 @@ SOURCES = {
 }
 
 
-def sample(name, count, rng, token, max_chars):
+PAGE = 100  # the viewer API's maximum rows per request
+
+
+def sample(name, count, rng, fetch, max_chars, full_scan_rows):
     dataset, config, split, convert = SOURCES[name]
-    total = fetch_row(dataset, config, split, 0, token)["num_rows_total"]
-    chosen, seen, tries = [], set(), 0
+    first = fetch(dataset, config, split, 0, PAGE)
+    total = first["num_rows_total"]
+
+    def usable(entry):
+        if entry.get("truncated_cells"):
+            return None  # an oversized row comes back cut short; it would not be the real prompt
+        return convert(entry["row"], max_chars) if name == "lmsys" else convert(entry["row"])
+
+    chosen = []
+    if total <= full_scan_rows:
+        # Small split (gsm8k test: 1319, mbpp test: 500): read it whole in a few pages and
+        # draw locally. 14 requests instead of 50+.
+        entries = list(first["rows"])
+        while len(entries) < total:
+            entries += fetch(dataset, config, split, len(entries), PAGE)["rows"]
+            print(f"  {name}: read {len(entries)}/{total}", end="\r", file=sys.stderr, flush=True)
+        for entry in rng.sample(entries, len(entries)):
+            item = usable(entry)
+            if item is not None:
+                chosen.append(dict(id=f"{name}/{split}/{entry['row_idx']}", dataset=name, **item))
+                if len(chosen) == count:
+                    break
+        if len(chosen) < count:
+            raise RuntimeError(f"only {len(chosen)} usable rows in {total}")
+        print(f"  {name}: {count} drawn from {total} rows (read whole split)        ", file=sys.stderr)
+        return chosen
+
+    # Large split (lmsys: 1M): one random row per request, so the sample is spread over all of it.
+    seen, tries = set(), 0
     while len(chosen) < count:
         tries += 1
         if tries > 20 * count:
@@ -97,11 +153,8 @@ def sample(name, count, rng, token, max_chars):
         if offset in seen:
             continue
         seen.add(offset)
-        page = fetch_row(dataset, config, split, offset, token)
-        if not page.get("rows") or page["rows"][0].get("truncated_cells"):
-            continue  # an oversized row comes back cut short; it would not be the real prompt
-        row = page["rows"][0]["row"]
-        item = convert(row, max_chars) if name == "lmsys" else convert(row)
+        rows = fetch(dataset, config, split, offset)["rows"]
+        item = usable(rows[0]) if rows else None
         if item is None:
             continue
         chosen.append(dict(id=f"{name}/{split}/{offset}", dataset=name, **item))
@@ -122,15 +175,30 @@ def main():
         default=6000,
         help="lmsys prompts longer than this are drawn again (the runner also caps by tokens)",
     )
+    parser.add_argument("--pause", type=float, default=1.0, help="seconds between API requests")
+    parser.add_argument("--full-scan-rows", type=int, default=5000,
+                        help="splits up to this size are read whole and sampled locally")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep prompts already in --out for datasets not being sampled now")
     args = parser.parse_args()
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        print("  (no HF_TOKEN: anonymous requests get the lowest rate limit, and lmsys will fail)", file=sys.stderr)
+    fetch = Fetcher(token, args.pause)
     prompts, failed = [], []
+    if args.keep and os.path.exists(args.out):
+        with open(args.out, encoding="utf-8") as file:
+            kept = [json.loads(line) for line in file if line.strip()]
+        prompts = [p for p in kept if p["dataset"] not in args.datasets]
+        if prompts:
+            print(f"  keeping {len(prompts)} prompts from {args.out}: "
+                  f"{', '.join(sorted({p['dataset'] for p in prompts}))}", file=sys.stderr)
     for name in args.datasets:
         try:
             # One generator per dataset: dropping or adding a dataset leaves the others' draws unchanged.
             rng = random.Random(f"{args.seed}/{name}")
-            prompts += sample(name, args.per_dataset, rng, token, args.max_chars)
+            prompts += sample(name, args.per_dataset, rng, fetch, args.max_chars, args.full_scan_rows)
         except urllib.error.HTTPError as error:
             hint = ""
             if name == "lmsys" and error.code in (401, 403):
@@ -144,6 +212,8 @@ def main():
 
     if not prompts:
         sys.exit("nothing was sampled; nothing written")
+    order = {name: i for i, name in enumerate(SOURCES)}
+    prompts.sort(key=lambda p: order.get(p["dataset"], len(order)))  # stable: draw order kept per dataset
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as file:
         for prompt in prompts:
