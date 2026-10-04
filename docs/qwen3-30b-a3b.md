@@ -624,6 +624,73 @@ Petals 自己的路由代码里也写死了 `overhead_delay = 0.018`(序列化�
 
 ---
 
+## 8. 真实负载:逐条回放 GSM8K / MBPP / LMSYS
+
+第 7 节一直用同一条合成 prompt,量的是容量。这一节换成真实分布的 prompt,回答另一个问题:
+**一个用户在空闲的链上,实际等多久。**
+
+| 脚本 | 做什么 |
+|---|---|
+| `examples/workload_sample.py` | 从 HF dataset viewer API 按随机 offset 逐行抽样,写 `task/workload/prompts.jsonl`。只用标准库,不下载整个数据集。每个数据集一个独立的随机数发生器,同一个 `--seed` 结果可复现,增删一个数据集不影响其他的 |
+| `examples/workload_bench.py` | 逐条跑:上一条结束立刻发下一条,并发始终为 1。每条一个 inference session,每次 `generate()` 一个 token,所以 TTFT 和每两个 token 之间的间隔都能量到。每条打印一行 `REC {json}`,日志本身就是结果文件;`--report` 把多份日志合起来出报告,不需要 torch |
+| `examples/cluster_gpumon.sh` | 每台一条长连接 ssh 跑 `nvidia-smi -l`,记 GPU 显存和利用率,供报告里的 Memory / Computation 用 |
+
+数据来源:`openai/gsm8k` (main/test,1319 条)、`google-research-datasets/mbpp` (full/test,500 条,
+用原论文的提示格式)、`lmsys/lmsys-chat-1m` (train,取对话里第一条用户消息;被 OpenAI moderation
+标记的和超过 6000 字符的重抽)。**lmsys-chat-1m 是 gated 数据集**:先用自己的 HF 账号在
+数据集页面接受条款,再 `export HF_TOKEN=...`;没有权限时它单独报错跳过,另外两个照常写出。
+
+### 指标口径
+
+| 指标 | 怎么算 |
+|---|---|
+| TTFT | 发出请求到第一个 token 返回,包含整条链上的 prefill |
+| generation latency | 端到端,直到 EOS 或 `--max-new-tokens` |
+| p50 / p90 / p99 | nearest-rank。注意 50 条样本的 p99 就是最大值,150 条时是第二大 |
+| TPOT | (latency − TTFT) / (输出 token − 1);另列每个 token 间隔的分布 |
+| throughput | Σ输出 token / Σ请求耗时。并发 1 下这就是单链单用户的速度,不是第 7 节的容量;另列含 prompt 的 token/s 和每分钟请求数 |
+| Memory | server 端 KV cache = (prompt + 输出) × 48 层 × 2048 B,即每 token 96 KiB,整条链合计;client 进程峰值 RSS;gpumon 记的每台 GPU 显存峰值 |
+| Computation | 估算 FLOPs = 2 × 3.3B 激活参数 × token 数(未计 attention);client 每条请求的 CPU 秒;每台 GPU 利用率均值和峰值 |
+
+默认值:`--max-new-tokens 256`;**关闭 thinking**(`enable_thinking=False`,否则 Qwen3 先写几百个
+token 的思考,generation latency 量的就是思考长度);prompt 超过 2048 token 记为 skipped;
+单条超过 `--request-timeout`(1800 s)视为链已经挂了,整轮以退出码 3 结束,而不是无声地卡住。
+某一条抛异常只记 failed,接着跑下一条。
+
+### 跑法
+
+`$A` `$B` 是第 7 节里两条钉死的链的 peer ID 列表。
+
+```bash
+# 1. 抽样:需要能访问 huggingface.co 的机器(prin3 不行就在 N08 上跑,再拷回 task/workload/)
+export HF_TOKEN=hf_...
+python3 examples/workload_sample.py --out task/workload/prompts.jsonl   # 默认 3 × 50 条, seed 0
+bash examples/qwen_cluster.sh deploy          # deploy 会把 task/ 一起带到各节点
+
+# 2. 冒烟:每条链 3 条,确认 REC 行正常
+CLIENT_SCRIPT=workload_bench.py bash examples/qwen_cluster.sh client --node N01 \
+  --prompts task/workload/prompts.jsonl --allowed-servers $A --tag A --limit 3
+
+# 3. 正式:两条链各从自己的 layer 0 节点出发,同时跑
+examples/cluster_gpumon.sh /tmp/gpu.csv &
+CLIENT_SCRIPT=workload_bench.py bash examples/qwen_cluster.sh client --node N01 \
+  --prompts task/workload/prompts.jsonl --allowed-servers $A --tag A > /tmp/wl.A.log 2>&1 &
+CLIENT_SCRIPT=workload_bench.py bash examples/qwen_cluster.sh client --node N11 \
+  --prompts task/workload/prompts.jsonl --allowed-servers $B --tag B > /tmp/wl.B.log 2>&1 &
+wait %2 %3; kill %1
+python3 examples/workload_bench.py --report /tmp/wl.A.log /tmp/wl.B.log --gpu-csv /tmp/gpu.csv
+```
+
+两条链各跑全部 150 条,相当于同一个实验做两遍,报告最后按 tag 分行,可以直接对比 A 和 B。
+想省一半时间,改成 A 用 `--shard 0/2`、B 用 `--shard 1/2`,各跑一半。
+
+时间:单 session 每 token 要走完 6 跳,约 0.2 s,256 个 token 约 50 s。150 条 2–3 小时;分片约一半。
+
+两点要记着:client 跑在 N01 / N11 上,而它们本身也是 server,第 7 节量过这会多出约 25% 的开销,
+这是"从 layer 0 节点发起"本身的代价,不是脚本的;两条链互不共享 server,所以同时跑不互相排队。
+
+---
+
 ## 不支持的
 
 配置里出现这些会在启动时直接报错,而不是跑出错结果:
@@ -660,6 +727,8 @@ Petals 自己的路由代码里也写死了 `overhead_delay = 0.018`(序列化�
 
 还没做的:
 
+- 第 8 节的真实负载测试:脚本已写好并用假模型离线验证过(计时、EOS/长度截断、失败与超时、报告合并),
+  还没在集群上跑过;抽样脚本连不上 HF 的环境里没法测,第一次跑时先看它的输出
 - `PETALS_INFERENCE_ROUTING=max_throughput` 的真实 A/B(上次那轮补丁没到节点,作废)
 - 每台 12 / 16 层、组更多条链的布局(第 7 节"下一步")
 - 另外 6 台(N02 N06 N08 N10 N11 N13)仍跟公网 NTP,和 N01 是两套来源。短期都是毫秒级,
