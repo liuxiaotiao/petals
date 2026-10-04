@@ -708,7 +708,7 @@ echo \$! > run/dht.pid
   local passthrough=""
   local name
   for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY ATTN_CACHE_TOKENS \
-              INFERENCE_MAX_LENGTH DHT_PREFIX MODEL_REVISION \
+              INFERENCE_MAX_LENGTH MAX_BATCH_SIZE DHT_PREFIX MODEL_REVISION \
               HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     [[ -n "${!name:-}" ]] && passthrough+="$name='${!name}' "
   done
@@ -1307,7 +1307,7 @@ service_env() {  # service_env <index> <peer>
   # The host's own blocks= wins over a NUM_BLOCKS inherited from this shell.
   if [[ -n "${NBLOCKS[$i]}" ]]; then printf '%s\n' "$(blocks_var_for "$i")"; fi
   for name in DEVICE TORCH_DTYPE NUM_BLOCKS BLOCKS BALANCE_QUALITY ATTN_CACHE_TOKENS \
-              INFERENCE_MAX_LENGTH DHT_PREFIX MODEL_REVISION \
+              INFERENCE_MAX_LENGTH MAX_BATCH_SIZE DHT_PREFIX MODEL_REVISION \
               HF_HUB_DISABLE_XET HF_ENDPOINT HF_TOKEN; do
     [[ "$name" == NUM_BLOCKS || "$name" == BLOCKS ]] && [[ -n "${NBLOCKS[$i]}" ]] && continue
     [[ -n "${!name:-}" ]] && printf '%s=%s\n' "$name" "${!name}"

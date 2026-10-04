@@ -686,6 +686,14 @@ python3 examples/workload_bench.py --report /tmp/wl.A.log /tmp/wl.B.log --gpu-cs
 
 时间:单 session 每 token 要走完 6 跳,约 0.2 s,256 个 token 约 50 s。150 条 2–3 小时;分片约一半。
 
+**先确认 server 的 `max_batch_size` 不小于最长的 prompt。** 第一次跑 150 条时,两条链各有 11 条
+失败,全是 `Task size greater than max_batch_size (256)`:prefill 一步要把整个 prompt(含 chat template)
+送进第一台 server,而 `run_qwen_server.sh` 从部署起就写死 `--max_batch_size 256`。第 7 节的合成
+prompt 很短,所以从没碰到。现在默认 2048(可用 `MAX_BATCH_SIZE` 覆盖),改完要 `deploy` 再
+`service restart`;server 没有固定 identity,重启后 peer ID 会变,`$A` `$B` 要重新取。
+失败的那几条不用整轮重跑:`--only-failed <旧日志>` 只重发它们,报告时把旧日志和重跑日志一起传进去,
+同一 (tag, id) 以最后一条为准。
+
 两点要记着:client 跑在 N01 / N11 上,而它们本身也是 server,第 7 节量过这会多出约 25% 的开销,
 这是"从 layer 0 节点发起"本身的代价,不是脚本的;两条链互不共享 server,所以同时跑不互相排队。
 

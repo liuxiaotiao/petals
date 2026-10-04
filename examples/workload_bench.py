@@ -100,6 +100,10 @@ def run(args):
     if args.shard:
         index, count = map(int, args.shard.split("/"))
         prompts = prompts[index::count]
+    if args.only_failed:
+        retry = failed_ids(args.only_failed)
+        prompts = [p for p in prompts if p["id"] in retry]
+        say(f"--only-failed: {len(prompts)} prompts failed in {' '.join(args.only_failed)}")
     if args.limit:
         prompts = prompts[: args.limit]
 
@@ -198,12 +202,24 @@ def load(paths):
                 for prefix, sink in (("RUN ", metas), ("REC ", recs), ("END ", ends)):
                     if line.startswith(prefix):
                         sink.append(json.loads(line[len(prefix):]))
-    return metas, recs, ends
+    # A retry run (--only-failed) logs the same request again: the last record for a
+    # (tag, id) is the one that counts, so a request that failed and then succeeded is ok.
+    latest = {}
+    for rec in recs:
+        latest[(rec.get("tag"), rec["id"])] = rec
+    return metas, list(latest.values()), ends
+
+
+def failed_ids(paths):
+    _, recs, _ = load(paths)
+    return {rec["id"] for rec in recs if "error" in rec}
 
 
 def gpu_summary(path):
-    """CSV lines: epoch,node,mem_used_mib,mem_total_mib,util_pct (from the gpumon loop)."""
+    """CSV lines: epoch,node,mem_used_mib,mem_total_mib,util_pct (from cluster_gpumon.sh)."""
     nodes = {}
+    if not os.path.exists(path):
+        return None
     for line in open(path, encoding="utf-8"):
         parts = [part.strip() for part in line.split(",")]
         if len(parts) != 5:
@@ -249,11 +265,21 @@ def summarize(metas, recs, ends, gpu_csv):
     say(f"\n{line}\nworkload report: {', '.join(tags)}  |  {len(ok)} ok, {len(skipped)} skipped, {len(errors)} failed")
     if meta:
         say(f"max_new_tokens {meta.get('max_new_tokens')}, thinking {meta.get('thinking')}, "
-            f"routing {meta.get('routing')}, chain {' '.join(meta.get('allowed_servers') or ['(any)'])}")
+            f"routing {meta.get('routing')}")
+        chains = {m.get("tag") or "-": " ".join(m.get("allowed_servers") or ["(any)"]) for m in metas}
+        for tag in sorted(chains):
+            say(f"  chain {tag}: {chains[tag]}")
+    stops = {reason: sum(r.get("stop") == reason for r in ok) for reason in ("eos", "length")}
+    finished = [r["latency"] for r in ok if r.get("stop") == "eos"]
+    say(f"stopped: {stops['eos']} answered (eos), {stops['length']} cut at max_new_tokens"
+        + (" -- end-to-end latency is capped for those" if stops["length"] else ""))
     say(line)
     say(f"{'seconds':30}{'mean':>9}{'p50':>9}{'p90':>9}{'p99':>9}")
-    for name, values in (("TTFT", ttft), ("generation latency, end to end", lat),
-                         ("time per output token", tpot), ("inter-token gap", gaps)):
+    rows = [("TTFT", ttft), ("generation latency, end to end", lat)]
+    if stops["length"] and finished:
+        rows.append(("  of which answered (eos)", finished))
+    rows += [("time per output token", tpot), ("inter-token gap", gaps)]
+    for name, values in rows:
         say(f"{name:30}{mean(values):9.3f}{pct(values, 50):9.3f}{pct(values, 90):9.3f}{pct(values, 99):9.3f}")
     say(line)
     say("throughput (sequential: one request in flight per chain)")
@@ -264,14 +290,15 @@ def summarize(metas, recs, ends, gpu_csv):
     groups = [("dataset", name, [r for r in ok if r["dataset"] == name]) for name in sorted({r["dataset"] for r in ok})]
     if len(tags) > 1:  # several logs, e.g. one per chain: show whether the chains behave alike
         groups += [("tag", tag, [r for r in ok if (r.get("tag") or "-") == tag]) for tag in tags]
-    say("by dataset / tag        n   prompt tok  output tok   TTFT s  latency s  TPOT ms")
+    say("by dataset / tag        n   prompt tok  output tok   TTFT s  latency s  TPOT ms  cut")
     for kind, name, group in groups:
         if not group:
             continue
         group_tpot = [(r["latency"] - r["ttft"]) / (r["output_tokens"] - 1) for r in group if r["output_tokens"] > 1]
         say(f"  {name if kind == 'dataset' else 'tag ' + name:16.16}{len(group):5}{mean([r['prompt_tokens'] for r in group]):12.0f}"
             f"{mean([r['output_tokens'] for r in group]):12.0f}{mean([r['ttft'] for r in group]):9.2f}"
-            f"{mean([r['latency'] for r in group]):11.1f}{1000 * mean(group_tpot):9.0f}")
+            f"{mean([r['latency'] for r in group]):11.1f}{1000 * mean(group_tpot):9.0f}"
+            f"{100 * sum(r.get('stop') == 'length' for r in group) / len(group):4.0f}%")
     say(line)
     kv = [(r["prompt_tokens"] + r["output_tokens"]) * kv_per_token / 2**20 for r in ok]
     say("memory")
@@ -290,7 +317,11 @@ def summarize(metas, recs, ends, gpu_csv):
         say(f"  client CPU per request         mean {mean(cpu):.2f} s ({100 * sum(cpu) / busy:.0f}% of one core)")
     if gpu_csv:
         nodes = gpu_summary(gpu_csv)
-        if nodes:
+        if nodes is None:
+            say(f"  server GPUs: {gpu_csv} not found (was cluster_gpumon.sh running?)")
+        elif not nodes:
+            say(f"  server GPUs: no samples in {gpu_csv}")
+        else:
             say(f"  server GPUs (sampled, {gpu_csv})")
             say(f"    {'node':6}{'util mean':>10}{'util max':>10}{'mem max MiB':>13}{'of':>8}")
             for node in sorted(nodes):
@@ -298,7 +329,19 @@ def summarize(metas, recs, ends, gpu_csv):
                 say(f"    {node:6}{mean(s['util']):9.1f}%{max(s['util']):9.0f}%{max(s['used']):13.0f}{s['total']:8.0f}")
     if errors:
         say(line)
-        say(f"failed requests, e.g. {errors[0]['id']}: {errors[0]['error']}")
+        say(f"failed requests: {len(errors)} (retry them with --only-failed LOG)")
+        kinds = {}
+        for r in errors:
+            message = r["error"]
+            message = message.split(": ", 2)[-1] if "rpc_inference" in message else message
+            kinds.setdefault(message[:90], []).append(r)
+        for message, group in sorted(kinds.items(), key=lambda kv: -len(kv[1])):
+            sizes = sorted(r["prompt_tokens"] for r in group)
+            say(f"  {len(group):3} x {message}")
+            say(f"        prompt tokens {sizes[0]}-{sizes[-1]}, datasets "
+                f"{', '.join(sorted({r['dataset'] for r in group}))}")
+        biggest_ok = max(r["prompt_tokens"] for r in ok)
+        say(f"  (largest prompt that succeeded: {biggest_ok} tokens)")
     say(line)
 
 
@@ -316,6 +359,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
     parser.add_argument("--thinking", action="store_true", help="let Qwen3 think first (much longer answers)")
+    parser.add_argument("--only-failed", nargs="+", metavar="LOG",
+                        help="rerun only the requests that failed in these logs; report old and new logs together")
     parser.add_argument("--limit", type=int, default=None, help="only the first N prompts (a smoke test)")
     parser.add_argument("--shard", default=None, metavar="I/N", help="every N-th prompt starting at I")
     parser.add_argument("--request-timeout", type=float, default=1800)

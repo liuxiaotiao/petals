@@ -14,6 +14,11 @@ python_bin="${PYTHON:-python}"
 # out. The client reserves exactly prompt + max_new_tokens per session, so this bounds the worst
 # case a single caller can demand, and does not make short requests any cheaper.
 #
+# MAX_BATCH_SIZE is the most tokens one inference step may carry, and the prefill step carries the
+# whole prompt (chat template included). It was 256 here until a real workload showed every prompt
+# over 256 tokens failing at the first server with "Task size greater than max_batch_size"; nothing
+# synthetic had been that long. 2048 matches the 2048 tokens of prompt INFERENCE_MAX_LENGTH allows.
+#
 # ATTN_CACHE_TOKENS is the cache BUDGET, not a reservation: per block it prices the larger of one
 # full-attention layer's K/V and one linear-attention layer's history+state at that many tokens,
 # times the blocks served, and the tensors are then allocated per session. A session costs a fixed
@@ -28,7 +33,7 @@ args=(
   --torch_dtype "${TORCH_DTYPE:-float16}" --quant_type none --device "${DEVICE:-cuda:0}" --inference_only
   --inference_max_length "${INFERENCE_MAX_LENGTH:-4096}"
   --attn_cache_tokens "${ATTN_CACHE_TOKENS:-65536}"
-  --max_batch_size 256 --max_chunk_size_bytes 16777216
+  --max_batch_size "${MAX_BATCH_SIZE:-2048}" --max_chunk_size_bytes 16777216
   --num_handlers 2 --no_auto_relay
 )
 
