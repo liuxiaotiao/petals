@@ -20,7 +20,7 @@ import multiprocessing
 import os
 import statistics
 import threading
-from time import perf_counter
+from time import perf_counter, sleep
 
 import torch
 from transformers import AutoTokenizer
@@ -105,6 +105,63 @@ def one_session(model, prompt_ids, new_tokens, out, index, trace=False):
     # The second call pays the same prefill, so the difference is the extra decode steps.
     per_token = max(1e-6, (total - ttft) / (new_tokens - 1))
     out[index] = ("ok", (ttft, [per_token] * (new_tokens - 1)))
+
+
+def run_closed_loop(model, prompt_ids, new_tokens, workers, duration, ramp):
+    """Keep `workers` sessions in flight for `duration` seconds and report steady-state throughput.
+
+    Each worker starts its next session the moment the previous one returns, so the load never
+    drains the way a fixed batch does at its tail. A session is one generate() call -- prefill
+    plus every new token -- which is what a real request costs, not the decode rate alone.
+
+    Throughput counts the tokens of sessions that *finish* inside [ramp, duration]. In steady
+    state the sessions cut off at the end balance the ones already running when the window
+    opens, and the ramp keeps the cold start, every worker prefilling at once, out of the number.
+    """
+    t0 = perf_counter()
+    deadline = t0 + duration
+    done, errors = [], []  # list.append is atomic; no lock needed
+
+    def worker():
+        while perf_counter() < deadline:
+            start = perf_counter()
+            try:
+                with torch.inference_mode():
+                    output = model.generate(prompt_ids, max_new_tokens=new_tokens, do_sample=False)
+            except Exception as error:  # one failed session must not stop the loop
+                errors.append(repr(error)[:200])
+                sleep(1)  # and a failing chain must not spin
+                continue
+            # Count what came back: greedy decoding can stop early at an EOS.
+            done.append((start - t0, perf_counter() - t0, output.shape[1] - prompt_ids.shape[1]))
+
+    for _ in range(workers):
+        threading.Thread(target=worker, daemon=True).start()
+    while perf_counter() < deadline:
+        sleep(min(15, max(0.1, deadline - perf_counter())))
+        say(f"  ... {perf_counter() - t0:.0f}s / {duration:.0f}s, {len(done)} sessions done, "
+            f"{len(errors)} errors", end="\r")
+    say("")
+
+    window = [(s, e, n) for s, e, n in list(done) if ramp <= e <= duration]
+    span = duration - ramp
+    say(f"closed loop: {workers} workers, measured {ramp:.0f}s-{duration:.0f}s ({span:.0f}s)")
+    if not window:
+        say(f"  no session finished inside the window; sessions take longer than {span:.0f}s here,")
+        say("  so raise --duration or lower --new-tokens")
+        say(f"RESULT workers={workers} sessions=0 tokens=0 tps=0 p50=0 p95=0 errors={len(errors)}")
+        return
+    latencies = sorted(e - s for s, e, _ in window)
+    p50 = latencies[int(0.50 * (len(latencies) - 1))]
+    p95 = latencies[int(0.95 * (len(latencies) - 1))]
+    tokens = sum(n for _, _, n in window)
+    say(f"  sessions finished       {len(window)}")
+    say(f"  tokens generated        {tokens}")
+    say(f"  throughput              {tokens / span:.2f} tok/s")
+    say(f"  session latency p50/p95 {p50:.1f}s / {p95:.1f}s  (prefill + up to {new_tokens} tokens)")
+    say(f"  errors                  {len(errors)}" + (f"  e.g. {errors[0]}" if errors else ""))
+    say(f"RESULT workers={workers} sessions={len(window)} tokens={tokens} tps={tokens / span:.3f} "
+        f"p50={p50:.2f} p95={p95:.2f} errors={len(errors)}")
 
 
 def arm_watchdog(seconds):
@@ -253,6 +310,19 @@ def main():
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="closed loop: keep --concurrency sessions in flight for this many seconds, starting "
+        "a new one as soon as one ends, and report steady-state throughput",
+    )
+    parser.add_argument(
+        "--ramp",
+        type=float,
+        default=60,
+        help="closed loop: seconds at the start left out of the measurement",
+    )
+    parser.add_argument(
         "--inline",
         action="store_true",
         help="run a single session on the main thread instead of a worker thread",
@@ -295,6 +365,18 @@ def main():
             say(f"warmup failed: {warm['errors'] or 'timed out'}")
             say("The swarm is not answering; check 'status' and 'diag' before reading further.")
             return 1
+
+    if args.duration:
+        if not 0 <= args.ramp < args.duration:
+            say(f"--ramp {args.ramp:.0f} must be at least 0 and below --duration {args.duration:.0f}")
+            return 2
+        run_closed_loop(model, prompt_ids, args.new_tokens, args.concurrency[0], args.duration, args.ramp)
+        routes = sorted(set(recorder.routes))
+        if routes:
+            say(f"\nroutes used ({len(recorder.routes)} sessions, {len(routes)} distinct):")
+            for route in routes[:6]:
+                say(f"  {route}")
+        return 0
 
     header = f"{'sessions':>8} {'TTFT ms':>9} {'ms/token':>10}" f" {'tok/s/sess':>11} {'tok/s total':>12}"
     say(header)
