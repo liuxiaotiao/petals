@@ -46,12 +46,12 @@ Petals 按参数名精确匹配加载,没有转换步骤,所以适配器保留�
 
 ---
 
-## 0. 控制节点环境:`~/petals/env.sh`
+## 0. 控制节点环境:`~/petals-env.sh`
 
 **这是整个流程里最容易出事的一步,首次部署时一半的时间耗在它身上。**
 
 ```bash
-cat > ~/petals/env.sh <<'EOF'
+cat > ~/petals-env.sh <<'EOF'
 cd ~/petals
 export NODE_PY=/home/ubuntu/anaconda3/envs/moe/bin/python   # 各节点已有的 conda 环境
 export HF_HUB_DISABLE_XET=1        # 必须:集群到不了 xethub
@@ -63,9 +63,13 @@ export MODEL_NAME=Qwen/Qwen3-30B-A3B
 EOF
 ```
 
+**放在仓库外面。** 它最早在 `~/petals/env.sh`。10/01 把 Mac 上的仓库整个 rsync 到控制节点时,
+`--delete` 把这个不在版本库里的文件一起删了,之后每条命令都静悄悄地回落到脚本默认的
+Qwen3.6 —— 见第 5 节"`service install` 把旧模型写进了 unit"。
+
 三条规矩:
 
-1. **每开一个新的 ssh 会话都要 `source ~/petals/env.sh`。** 变量只活在那一个 shell 里。
+1. **每开一个新的 ssh 会话都要 `source ~/petals-env.sh`。** 变量只活在那一个 shell 里。
 2. **`ssh host && source ...` 是错的。** `ssh` 是交互式的,`&&` 后面要等你退出 ssh 才执行,
    而且是在本地执行。先 ssh 进去,再单独 source。
 3. **`bash env.sh` 也是错的**,那是子进程,`export` 的东西跟着子进程一起消失。
@@ -84,7 +88,7 @@ echo "XET=[$HF_HUB_DISABLE_XET] PROXY=[$PROXY_NODE] NODE_PY=[$NODE_PY] MODEL=[$M
 ## 1. 从 Qwen3.6 切过来
 
 ```bash
-source ~/petals/env.sh
+source ~/petals-env.sh
 
 bash examples/qwen_cluster.sh service stop          # 必须用 service stop
 bash examples/qwen_cluster.sh service status        # 15 台 inactive
@@ -141,7 +145,7 @@ ssh ubuntu@192.168.1.2 'tr "\0" "\n" < /proc/$(cat ~/petals-qwen/run/server.pid)
 ## 3. 全量铺开
 
 ```bash
-source ~/petals/env.sh
+source ~/petals-env.sh
 
 bash examples/qwen_cluster.sh deploy
 bash examples/qwen_cluster.sh preflight          # 服务停着,量到的才是真实空闲显存
@@ -194,7 +198,7 @@ bash examples/qwen_cluster.sh bench --concurrency 1 4 8 16 --new-tokens 128 --ti
 
 集群到不了 Xet 存储后端。意味着 `HF_HUB_DISABLE_XET` 没进到服务端进程里。
 
-确认:`/proc/<pid>/environ` 那条命令。修:`source ~/petals/env.sh` 之后
+确认:`/proc/<pid>/environ` 那条命令。修:`source ~/petals-env.sh` 之后
 `start --restart`(`--restart` 不能省,`start` 会跳过已在跑的服务端)。
 
 ### `ReadTimeout ... us.aws.cdn.hf.co`
@@ -245,8 +249,59 @@ ssh ubuntu@<ip> 'sudo systemctl restart chrony && sleep 15 && sudo chronyc makes
 改完**用墙上时钟复验**,不要信 chrony 的自述。bootstrap 节点(N01)对齐之后
 最好重启一次 DHT,让它用新时间。
 
-> `synctime` 子命令目前只读各主机 NTP 守护进程的自述,**看不出"两台各自同步到了
-> 不同的源"这种情况**,会打出一片 `±0.000s`。修这个之前,以上面两条命令为准。
+> `synctime` 现在会检查每台 `Ref time` 的年龄:超过 `NTP_REF_MAX_AGE`(默认 1 小时)
+> 就不再相信守护进程的自述,改用 SSH 往返对时,并把这些主机单独点名为
+> `Not actually disciplined`。以它的结论为准即可,上面两条命令留作手工复核。
+
+### 15 台只剩 7 台在服务,`status` 却说 "The swarm is usable"
+
+10/03 才发现的,但 10/01 下午就开始了。之后两天所有压测跑的都是 7 台。
+
+**症状。** `status` 汇总行是 `6 server(s) online`(不是 15),主机表里 8 台 `DOWN`;
+`service status` 里这 8 台是 `none ... restarts=5`。而汇总的最后一句仍然是
+`Every layer is online ... The swarm is usable` —— 它只检查层有没有覆盖,不检查少了几台。
+**以后看 `status` 先数 `N server(s) online`。**
+
+**因果链。**
+
+1. 这 8 台(N03 N04 N05 N07 N09 N12 N14 N15)的 chrony 只配了公网池,而它们没有 UDP 出网
+   (NTP 是 UDP 123,HTTP 代理带不了),8 月 18 日之后一次都没同步过,以约 80 ms/天
+   的速度一起往前漂
+2. 10/01 下午某次重启时漂移已超过 3 秒,`Server.__init__` 加入 DHT 就撞 `ValidationError`
+3. unit 里 `StartLimitIntervalSec=900`、`StartLimitBurst=5`:15 分钟内失败 5 次,
+   systemd 就放弃、不再重试。这个上限本身是对的(防止无限重启),代价是一次暂时性故障
+   变成了永久停机
+4. 10/02 用 `synctime --yes` 对过表,但那时已经没有任何东西在重试,所以没有救回来
+
+**修复,三步:**
+
+```bash
+# 1. 让 N01 对内授时(它自己能连上公网 NTP;上游断了也继续服务)
+ssh ubuntu@192.168.1.2 sudo bash -s <<'X'
+conf=/etc/chrony/chrony.conf
+grep -q '^allow 192.168.0.0/16' "$conf" || printf '\nallow 192.168.0.0/16\nlocal stratum 10\n' >> "$conf"
+systemctl restart chrony
+X
+
+# 2. 没有出网的主机都指向 N01(幂等,重跑无害)
+for n in N03 N04 N05 N07 N09 N12 N14 N15; do
+  ip=$(awk -v id=$n '$1==id{split($2,a,":");print a[1]}' task/hosts.txt)
+  ssh ubuntu@$ip sudo bash -s <<'X'
+conf=/etc/chrony/chrony.conf
+grep -q '^server 192.168.1.2 ' "$conf" || printf '\nserver 192.168.1.2 iburst prefer minpoll 4 maxpoll 6\n' >> "$conf"
+systemctl restart chrony
+X
+done
+bash examples/qwen_cluster.sh synctime     # 15 台都应是 its own NTP daemon
+
+# 3. 只重启死掉的那几台(service restart 自带 reset-failed,能清掉 StartLimit 状态)
+grep -E '^(N03|N04|N05|N07|N09|N12|N14|N15) ' task/hosts.txt > task/hosts.revive
+HOSTS_FILE=task/hosts.revive bash examples/qwen_cluster.sh service restart
+```
+
+`chronyc -n sources` 里 N01 那行开头是 `^?` 不一定是够不着 —— 刚重启 10 秒内样本不够。
+看 `Reach` 列:不是 0 就是通的。最终确认看 N01 上的 `sudo chronyc -n clients`,
+应该列出这几台。
 
 ### `MissingBlocksError: No servers holding blocks [...]`
 
@@ -262,9 +317,52 @@ Using DHT prefix: Qwen3-6-35B-A3B-petals-qwen-v1
 ```
 
 这个 shell 里 `MODEL_NAME` 没设,回落到脚本默认值了,你查的是**另一个 swarm**,
-下面的层覆盖信息全部无效。`source ~/petals/env.sh` 重跑。
+下面的层覆盖信息全部无效。`source ~/petals-env.sh` 重跑。
 
 认准这行:对的应该是 `Qwen3-30B-A3B-petals-qwen3-moe-v1` 和 `48 layers`。
+
+### `service install` 把旧模型写进了 unit
+
+```
+MODEL_NAME is not set, so this run uses the built-in default Qwen/Qwen3.6-35B-A3B.
+Environment: MODEL_NAME=Qwen/Qwen3.6-35B-A3B ...
+```
+
+`install` 只警告、不拒绝,于是**把错的模型名写进了持久化的环境文件**,随后的 `restart`
+让那台去服务一个不存在的 swarm。`install` 输出里的 `Environment:` 那行每次都要看一眼。
+修:`source ~/petals-env.sh` 之后对那几台重跑 `install` + `restart`。
+
+### `service install` 写出 `proxy=no`
+
+```
+No proxy registered: the units will be written WITHOUT HTTPS_PROXY.
+```
+
+代理进程可能还在 N08 上正常跑(`proxy status` 显示 `running, N tunnel(s)`),只是控制节点
+`.qwen-cluster/proxy_addr` 里的登记丢了。`proxy start` 是幂等的:进程在跑就只补登记,
+不会重启它。补完再 `install`。
+
+N06、N07(在 `PROXY_SKIP` 里,有自己的出口)和 N08(代理本身)显示 `proxy=no` 是对的。
+
+### 新节点上跑 `bench`,卡在 `ReadTimeout ... us.aws.cdn.hf.co`
+
+客户端要的 embedding / lm_head 分片在 `~/.cache/huggingface`(不是服务端的
+`~/petals-qwen/cache`),新节点上是冷的,要现下约 5 GB。几个节点同时冷启动、又都挤 N08
+的代理,会一直超时。从已经有缓存的节点(N08)走局域网播种,**只拷这个模型的目录**:
+
+```bash
+src=$(awk '$1=="N08"{split($2,a,":");print a[1]}' task/hosts.txt)
+rsync -az ubuntu@$src:.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B/ /tmp/seed30b/
+rsync -az /tmp/seed30b/ ubuntu@<目标IP>:.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B/
+```
+
+整个 `~/.cache/huggingface` 一起拷会把别的模型也带过去 —— 这样干过一次,三台磁盘直接写满。
+
+### `bench` 打完表格不退出
+
+`os._exit` 跳过了 multiprocessing 的清理,hivemind 的 DHT 子进程活了下来,还握着继承的
+stdout,ssh 要等这根管道关掉才返回。`42cb9e8` 之后的 bench 会先结束子进程再退出;
+节点上还是旧版本就 `deploy` 一次。症状是多节点并发压测末尾的 `wait` 永远不返回。
 
 ---
 
@@ -306,6 +404,226 @@ examples/cluster_disk.sh survey --host N03            # 单台
 
 ---
 
+## 7. 吞吐与并发:实测
+
+2026-10-02 至 10-04 在这 15 台上测的。先说结论,再说怎么测、数从哪来。
+
+### 结论
+
+- **容量 = 完整链数 × 每链约 32 tok/s。** 两条链同时压满,总吞吐恰好等于各自单独压满之和
+  (65.04 vs 64.98),链与链之间没有共享瓶颈。
+- **每链的上限来自每跳约 31 ms 的串行服务时间,其中 GPU 实际计算只占约 3 ms。**
+  其余是 RPC、序列化、调度。满负载时 GPU 大约九成时间空闲 —— 这是 Petals 的软件开销上限,
+  不是硬件上限。
+- **`status` 里的 `inference_rps`(~300)不能用来做容量规划。** 实际可用的串行速率约 32 步/秒,
+  差将近 10 倍。
+- **网关(客户端)不要放在承担层的节点上。** 同样的在途会话数,入口放在 layer 0 节点比
+  放在闲置机器上低约 20%,比完全分散低约 25%。
+- **不钉死布局,多出来的机器几乎不涨吞吐。** 15 台自动布局只测到 34–35 tok/s,和 7 台一样。
+  原因见下面"为什么是这个数"。
+
+### 推荐布局:钉死成两条完整链
+
+48 层按 8 层一段切成 6 段,12 张 24GB 卡每段 2 台,正好两条互不重叠的链:
+
+| | 0:8 | 8:16 | 16:24 | 24:32 | 32:40 | 40:48 |
+|---|---|---|---|---|---|---|
+| **A** | N01 | N05 | N03 | N07 | N02 | N06 |
+| **B** | N11 | N08 | N09 | N13 | N04 | N10 |
+
+3 台 T4(N12 N14 N15)只装得下 7 层,不进任何链,`blocks=7` 交给均衡器,压测时当网关用。
+
+`task/hosts.txt` 里写范围就是钉死(`blocks=0:8`),写数字是"带几层、位置交给 swarm":
+
+```bash
+pin() { sed -i -E "s/^($1 .*)blocks=[0-9:]+/\1blocks=$2/" task/hosts.txt; }
+pin N01 0:8;   pin N11 0:8;   pin N05 8:16;  pin N08 8:16
+pin N03 16:24; pin N09 16:24; pin N07 24:32; pin N13 24:32
+pin N02 32:40; pin N04 32:40; pin N06 40:48; pin N10 40:48
+```
+
+**分两波重启**,每段始终留一台在线;**要换段的节点先从同段的节点播种分片**,不然它会经代理
+重下约 13 GB(`seed_span` 的定义见下)。
+
+```bash
+grep -E '^(N01|N08|N06|N13|N03|N02) ' task/hosts.txt > task/hosts.wave1
+grep -E '^(N11|N05|N10|N07|N09|N04) ' task/hosts.txt > task/hosts.wave2
+for w in wave1 wave2; do
+  HOSTS_FILE=task/hosts.$w bash examples/qwen_cluster.sh service install    # 看 Environment 行和 proxy=
+  HOSTS_FILE=task/hosts.$w bash examples/qwen_cluster.sh service restart
+  # 等到 status 显示 15 server(s) online, 0 still joining 再下一波
+done
+```
+
+三个坑,都踩过:
+
+- **只钉一部分,剩下的会连锁挪位。** 钉走 N05 之后,均衡器把 N13 从 24:32 挪到了 32:40,
+  一台 T4 挪到 22:29,结果 29–31 层只剩一台。要钉就把 12 台一起钉
+- **T4 的 7 层段会切出单点。** 自动布局里一台 T4 占了 `0:7`,第 7 层只剩 N01 一台,
+  所有会话都得经过它
+- **均衡器不会自己修好上面这种情况。** 每台只问"我自己挪是不是更好",是就挪,不是就不动
+  (`if local_span.start == new_start: return False`)。15 台各自都在局部最优上,
+  没有哪一台单独挪一下能补上那一层
+
+播种函数:从源节点按 `model.safetensors.index.json` 挑出含指定层的分片,经控制节点的管道
+直接流到目标节点,控制节点不落盘:
+
+```bash
+seed_span() {  # seed_span <源节点> <目标节点> <起始层> <结束层>
+  local s d
+  s=$(awk -v id=$1 '$1==id{split($2,a,":");print a[1]}' task/hosts.txt)
+  d=$(awk -v id=$2 '$1==id{split($2,a,":");print a[1]}' task/hosts.txt)
+  ssh ubuntu@$s "LO=$3 HI=$4 bash -s" <<'X' | ssh ubuntu@$d "cd ~/petals-qwen/cache/models--Qwen--Qwen3-30B-A3B && tar xf - --skip-old-files && echo received"
+cd ~/petals-qwen/cache/models--Qwen--Qwen3-30B-A3B
+snap=$(ls -d snapshots/*/ | head -1)
+~/petals-qwen/venv/bin/python - "$snap" > /tmp/need.$$ <<'PY'
+import json, os, sys
+snap, lo, hi = sys.argv[1], int(os.environ["LO"]), int(os.environ["HI"])
+wm = json.load(open(os.path.join(snap, "model.safetensors.index.json")))["weight_map"]
+for f in sorted({f for k, f in wm.items() if any(k.startswith(f"model.layers.{i}.") for i in range(lo, hi))}):
+    link = os.path.join(snap, f)
+    print(link)
+    print(os.path.normpath(os.path.join(snap, os.readlink(link))))
+PY
+echo "shipping $(grep -c safetensors /tmp/need.$$) shards, $(xargs du -chL < /tmp/need.$$ | tail -1 | cut -f1)" >&2
+tar cf - -T /tmp/need.$$
+rm -f /tmp/need.$$
+X
+}
+seed_span N07 N13 24 32
+```
+
+8 层约 3–4 个分片、12–15 GB。不加 `-z`:权重不可压缩,压缩只会把 CPU 变成瓶颈。
+
+### 怎么测
+
+**工具。**
+
+| | 作用 |
+|---|---|
+| `qwen_cluster.sh peers` | 每台当前的完整 peer id 和层段。`status` 只显示 id 末 6 位,不够用。每次重启 id 都会变,所以重启后要重新取 |
+| `bench --allowed-servers <peer…>` | 这个客户端的所有会话只走列出的服务端,即钉在一条链上 |
+| `bench --duration 900 --ramp 120` | 闭环:`--concurrency` 个 worker,每个会话结束立刻开下一个;只统计在窗口内结束的会话。最后一行 `RESULT key=value …` 便于多进程加总 |
+| `PETALS_INFERENCE_ROUTING=max_throughput` | 推理改用随机挑副本(Petals 训练时用的策略)。**未验证**,见下 |
+
+拼链和跑法:
+
+```bash
+bash examples/qwen_cluster.sh peers | tee /tmp/peers.txt
+chain() { awk -v want=" $* " 'index(want, " "$1" ") {print $2}' /tmp/peers.txt | tr '\n' ' '; }
+A=$(chain N01 N05 N03 N07 N02 N06)
+B=$(chain N11 N08 N09 N13 N04 N10)
+NODES=$(sed 's/#.*//' task/hosts.txt | awk 'NF {print $1}')
+
+# 批量:15 台各起一个客户端,每个 2 个会话,全部钉在 A 链
+for n in $NODES; do
+  bash examples/qwen_cluster.sh bench --node $n --prompt-tokens 128 --new-tokens 256 \
+       --concurrency 2 --timeout 1200 --allowed-servers $A > /tmp/b.A.$n.log 2>&1 &
+done; wait
+```
+
+**汇总时的三个坑,每一个都让结论错过一次:**
+
+1. **`tok/s/sess`(第 4 列)是每个会话的速度。** 一个客户端跑 `--concurrency c` 时,
+   它对总吞吐的贡献是 `c × 第 4 列`,不是第 4 列本身
+2. **日志里有 `\r`。** 进度提示原地刷新,重定向到文件后和数据行挤在同一行,先 `tr '\r' '\n'`
+3. **第 5 列 `tok/s total` 把 TTFT 也算进了墙钟**,和上面的口径不同,不要混用
+
+```bash
+for f in /tmp/b.A.*.log; do tr '\r' '\n' < "$f" | grep -E '^ +2 +[0-9]+ +[0-9]+ +[0-9.]+ +[0-9.]+'; done \
+  | awk '{n++; s += $4} END {printf "%d clients | %.2f tok/s\n", n, 2*s}'
+# 闭环模式直接加 RESULT 行:
+cat /tmp/cl.*.log | tr '\r' '\n' | grep '^RESULT' \
+  | awk '{for (i=2;i<=NF;i++) {split($i,kv,"="); v[kv[1]]+=kv[2]}} END {print v["tps"], "tok/s"}'
+```
+
+**每台到底接了多少会话**,看服务端日志里的 `rpc_inference.close` 条数(批量模式下 bench 的
+每个会话会调两次 `generate()`,所以一个会话在每台上记两条)。这是判断路由有没有分流的
+唯一可靠办法 —— 之前就是靠它发现 8 台已经离线的。
+
+### 结果
+
+**单会话**(钉死布局,客户端在各自链的 layer 0 节点上):
+
+| | 单独跑 | 两条链同时跑 |
+|---|---|---|
+| A 链(全 A30) | 279 ms/token | 301 |
+| B 链(A30 + RTX 6000) | 328 | 325 |
+
+**单链饱和曲线**(10/02 测于 7 台在线、实际只有一条链的状态,5 个客户端):
+
+| 在途会话 | 1 | 3 | 5 | 10 | 20 | 40 |
+|---|---|---|---|---|---|---|
+| 总吞吐 tok/s | 3.04 | 8.13 | 12.52 | 24.14 | 30.84 | 31.60 |
+| ms/token | 329 | ~371 | ~400 | 414 | 648 | 1266 |
+
+20 个会话就拿到约 95% 的吞吐,再往上只增加延迟。饱和区里 `ms/token ≈ 31 ms × 会话数`,
+截距几乎为零,纯排队。同一时期 15 个客户端 × 3 = 45 个会话测得 32.61,和 5 个客户端
+× 8 = 40 个会话的 31.60 几乎一样,说明客户端不是瓶颈。
+
+**两条链的可加性**(批量,每链 30 个在途会话,15 台各起客户端):
+
+| | 单独跑 | 同时跑 |
+|---|---|---|
+| A 链 | 33.30 | 34.24 |
+| B 链 | 31.68 | 30.80 |
+| 合计 | 64.98 | **65.04** |
+
+**网关放在哪**(闭环,128 token 一个会话,900 秒,前 120 秒不计):
+
+| 客户端在哪 | 进程 | 每链在途 | A | B | 合计 |
+|---|---|---|---|---|---|
+| layer 0 节点 N01 / N11(本身在服务) | 1 | 16 | 21.00 | 21.00 | 42.0 |
+| 闲置 T4 N12 / N14 | 1 | 15 | 25.93 | 27.08 | 53.0 |
+| 15 台分散,每台 1 个 worker | 15 | 15 | 29.04 | 26.75 | 55.8 |
+
+挪到闲置机器上就追回了约 80%:主要是客户端和服务端抢同一台机器的 CPU
+(每个 token 客户端要做 embedding、CPU 上 fp32 的 lm_head,以及 6 跳的序列化)。
+A 链从单进程到多进程还有 3 tok/s 的差,约等于一批会话的量化误差:单进程里的 worker
+同时起步、长度相同,会一直成批完成,分辨率只有约 ±2.6 tok/s。
+
+**不钉死的 15 台**(自动布局,10/03):30 个会话 34.14、45 个会话 34.44 —— 和 7 台时的
+32.4 / 32.6 几乎一样。
+
+### 为什么是这个数
+
+**客户端站在每一跳中间。** `inference_session.py` 的 `step()` 逐段调用服务端,每段的输出
+先回到客户端再发给下一段,没有服务端之间的直传。每个 token 是 6 次往返。
+
+**服务端一次只做一个任务。** `PrioritizedTaskPool` 每次只取一个任务,不跨会话 batch。
+于是每台的服务时间约 31 ms/步,而它自报的 `inference_rps≈313` 折合约 3.2 ms 的纯计算;
+Petals 自己的路由代码里也写死了 `overhead_delay = 0.018`(序列化开销 18 ms)。
+
+**推理路由是确定性的最短路。** `min_latency` 模式按 `0.018 + 层数 / inference_rps` 加上 RTT
+跑 Dijkstra,所有客户端算出同一条路,每段公告 rps 最高的副本拿走全部流量。唯一的负载反馈是
+`cache_tokens_left` 不够时的 10 秒惩罚,而 65536 的缓存能装 170 个 384-token 会话,
+永远触发不了。实测:自动布局下 16:24 有 4 台,一台接了 100%,另外三台一个会话都没有;
+只有两台 rps 相差不到 1 ms 每跳的段(32:40、40:48)才部分分流。钉死成链再加
+`--allowed-servers` 后,这个问题就不存在了。
+
+`PETALS_INFERENCE_ROUTING=max_throughput`(`a3d5f54`)本该让副本随机分流,但做 A/B 的那一轮
+补丁还没部署到节点上,两轮实际都是 `min_latency`,**所以它的效果没有被验证过**。
+在容器里按同样的随机策略回放 20 万次:只要还有单副本的层(比如上面的第 7 层),
+那一台仍然接 100%,随机路由也没用;每层都 ≥2 时,最忙的一台降到 50%。
+
+### 下一步(未验证)
+
+既然每跳的代价基本是固定开销、和带几层关系不大,那每台带的层越多,一条链用的机器越少,
+同样的卡就能组越多条链:
+
+| 每台层数 | 每链几台 | 12 张 24GB 卡几条链 | 预测吞吐 |
+|---|---|---|---|
+| 8(现在) | 6 | 2 | 65(实测) |
+| 12 | 4 | 3 | ~95 |
+| 16 | 3 | 4 | ~120 |
+
+16 层约 18.7 GiB 权重,加缓存约 21 GB,是 24GB 卡的极限(可以把 `ATTN_CACHE_TOKENS` 降到
+32768 省出约 1 GB);分片约 26 GB,有几台磁盘偏紧。先用 3 台 A30 钉成 `0:16 / 16:32 / 32:48`
+单独压一条链:还能到 30 tok/s 上下,这个思路就成立;明显掉下来,说明 16 层时计算已经
+不能忽略,12 层会是更好的折中。
+
+---
+
 ## 不支持的
 
 配置里出现这些会在启动时直接报错,而不是跑出错结果:
@@ -331,12 +649,18 @@ examples/cluster_disk.sh survey --host N03            # 单台
 - 参数名与 Hub 分片索引的键集合逐一比对
 - 缓存记账、配置注册与拒绝路径:`tests/test_qwen3_moe.py` 共 27 个用例全过
 
-真机(2026-10-01,15 节点):
+真机(15 节点):
 
-- 48 层全覆盖,15 台 ONLINE,客户端生成中文正常
-- `cache_tokens_left` 在 8 层和 7 层两种 span 上都与离线公式逐位吻合
+- 2026-10-01:48 层全覆盖,15 台 ONLINE,客户端生成中文正常;`cache_tokens_left` 在 8 层和
+  7 层两种 span 上都与离线公式逐位吻合
+- 同一天下午约 14:08,时钟漂移的 8 台在一次重启后再也没起来(第 5 节"15 台只剩 7 台"),
+  10/03 才发现。**在那之前的所有压测都只有 7 台在服务**
+- 2026-10-03:时钟永久修复(N01 对内授时),15 台恢复;钉死成两条链
+- 2026-10-04:吞吐基准完成,见第 7 节
 
-还没做的:**吞吐基准**。`bench` 还没在这个模型上跑出过基线。
-注意 Petals **不跨会话做 batching**(`task_pool.py:35` 的注释),所以压测压出来的是
-每步固定开销,不是 GPU 算力上限 —— 单客户端进程还会先撞上本机 CPU 上 fp32 的
-lm_head。要测集群上限得从多个节点同时打。
+还没做的:
+
+- `PETALS_INFERENCE_ROUTING=max_throughput` 的真实 A/B(上次那轮补丁没到节点,作废)
+- 每台 12 / 16 层、组更多条链的布局(第 7 节"下一步")
+- 另外 6 台(N02 N06 N08 N10 N11 N13)仍跟公网 NTP,和 N01 是两套来源。短期都是毫秒级,
+  想彻底统一就把第 5 节那段 chrony 配置在这 6 台上也跑一遍

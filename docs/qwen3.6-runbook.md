@@ -27,7 +27,7 @@
 
 ## 1. 控制节点环境变量
 
-把这段存成 `~/petals/env.sh`,每次开新终端 `source ~/petals/env.sh`:
+把这段存成 `~/petals-env.sh`,每次开新终端 `source ~/petals-env.sh`:
 
 ```bash
 cd ~/petals
@@ -50,7 +50,7 @@ export CLEANUP_ON_START=gpu        # start 前先清掉占卡的外来进程
 ## 2. 从零到可用:完整顺序
 
 ```bash
-source ~/petals/env.sh
+source ~/petals-env.sh
 
 # ---- 第 1 步:清场 ----
 bash examples/qwen_cluster.sh cleanup              # 只列不杀,先看看有什么
