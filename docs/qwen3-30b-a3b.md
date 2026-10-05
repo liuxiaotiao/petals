@@ -624,21 +624,26 @@ Petals 自己的路由代码里也写死了 `overhead_delay = 0.018`(序列化�
 
 ---
 
-## 8. 真实负载:逐条回放 GSM8K / MBPP / LMSYS
+## 8. 真实负载:逐条回放 GSM8K / MBPP / No Robots
 
 第 7 节一直用同一条合成 prompt,量的是容量。这一节换成真实分布的 prompt,回答另一个问题:
 **一个用户在空闲的链上,实际等多久。**
 
 | 脚本 | 做什么 |
 |---|---|
-| `examples/workload_sample.py` | 从 HF dataset viewer API 抽样,写 `task/workload/prompts.jsonl`。只用标准库:gsm8k、mbpp 这种小的 split 按 100 行一页整个读下来再本地抽,lmsys 一百万条则每次请求取一行随机 offset。请求之间默认隔 1 s,遇到 429 按 `Retry-After` 等(第一次跑时连发 50 个请求就被限流过)。`--datasets lmsys --keep` 只重抽一个、保留文件里其他的。每个数据集一个独立的随机数发生器,同一个 `--seed` 结果可复现,增删一个数据集不影响其他的 |
+| `examples/workload_sample.py` | 从 HF dataset viewer API 抽样,写 `task/workload/prompts.jsonl`。只用标准库:gsm8k、mbpp 这种小的 split 按 100 行一页整个读下来再本地抽,lmsys 一百万条则每次请求取一行随机 offset。请求之间默认隔 1 s,遇到 429 按 `Retry-After` 等(第一次跑时连发 50 个请求就被限流过)。`--datasets norobots --keep` 只重抽一个、保留文件里其他的。每个数据集一个独立的随机数发生器,同一个 `--seed` 结果可复现,增删一个数据集不影响其他的 |
 | `examples/workload_bench.py` | 逐条跑:上一条结束立刻发下一条,并发始终为 1。每条一个 inference session,每次 `generate()` 一个 token,所以 TTFT 和每两个 token 之间的间隔都能量到。每条打印一行 `REC {json}`,日志本身就是结果文件;`--report` 把多份日志合起来出报告,不需要 torch |
 | `examples/cluster_gpumon.sh` | 每台一条长连接 ssh 跑 `nvidia-smi -l`,记 GPU 显存和利用率,供报告里的 Memory / Computation 用 |
 
 数据来源:`openai/gsm8k` (main/test,1319 条)、`google-research-datasets/mbpp` (full/test,500 条,
-用原论文的提示格式)、`lmsys/lmsys-chat-1m` (train,取对话里第一条用户消息;被 OpenAI moderation
-标记的和超过 6000 字符的重抽)。**lmsys-chat-1m 是 gated 数据集**:先用自己的 HF 账号在
-数据集页面接受条款,再 `export HF_TOKEN=...`;没有权限时它单独报错跳过,另外两个照常写出。
+用原论文的提示格式)、`HuggingFaceH4/no_robots` (default/test,500 条,人工写的指令和回答;
+**只取单轮会话**:去掉 system 后恰好是一条 user 加一条 assistant,多轮的 Chat 类跳过;有 system
+消息的保留它作为 prompt 的一部分,`meta.has_system` 标出来;超过 6000 字符的重抽)。
+
+最早第三个数据集是 `lmsys/lmsys-chat-1m`(第一条用户消息),2026-10-05 起默认换成 No Robots 的
+单轮会话:lmsys 是 gated 的、要 HF_TOKEN 和接受条款,而且真实用户输入里大量是极短或重复的
+寒暄。lmsys 仍可用 `--datasets gsm8k mbpp lmsys` 选。因为每个数据集用自己的随机数发生器,
+换掉第三个不改变 gsm8k 和 mbpp 抽到的题,前后两轮在这两个数据集上可以逐题对比。
 
 ### 指标口径
 

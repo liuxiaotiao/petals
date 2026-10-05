@@ -1,7 +1,7 @@
 """Draw a fixed, reproducible set of real prompts for workload_bench.py.
 
   python3 examples/workload_sample.py --out task/workload/prompts.jsonl
-  python3 examples/workload_sample.py --per-dataset 50 --datasets gsm8k mbpp lmsys --seed 0
+  python3 examples/workload_sample.py --per-dataset 50 --datasets gsm8k mbpp norobots --seed 0
   python3 examples/workload_sample.py --datasets lmsys --keep   # redo one, keep the others
 
 Standard library only, so it runs on the control node or on any host with Hub access.
@@ -90,6 +90,24 @@ def mbpp(row):
     return dict(messages=[{"role": "user", "content": prompt}], reference=tests)
 
 
+def norobots(row, max_chars):
+    """Single-turn No Robots conversations only: one user message, one assistant answer
+    (a system message, when present, is kept as part of the prompt). None to skip."""
+    messages = row.get("messages") or []
+    turns = [m for m in messages if m.get("role") != "system"]
+    if [m.get("role") for m in turns] != ["user", "assistant"]:
+        return None  # multi-turn chat, or malformed
+    user = turns[0].get("content", "")
+    if not user.strip() or len(user) > max_chars:
+        return None
+    system = [{"role": "system", "content": m["content"]} for m in messages if m.get("role") == "system"][:1]
+    return dict(
+        messages=system + [{"role": "user", "content": user}],
+        reference=turns[1].get("content"),
+        meta=dict(category=row.get("category"), has_system=bool(system)),
+    )
+
+
 def lmsys(row, max_chars):
     """First user turn of the conversation; None to draw again."""
     if any(entry.get("flagged") for entry in row.get("openai_moderation") or []):
@@ -107,11 +125,17 @@ def lmsys(row, max_chars):
 SOURCES = {
     "gsm8k": ("openai/gsm8k", "main", "test", gsm8k),
     "mbpp": ("google-research-datasets/mbpp", "full", "test", mbpp),
+    # Human-written instructions and answers (HuggingFaceH4/no_robots, test split: 500 rows).
+    "norobots": ("HuggingFaceH4/no_robots", "default", "test", norobots),
     "lmsys": ("lmsys/lmsys-chat-1m", "default", "train", lmsys),
 }
 
 
 PAGE = 100  # the viewer API's maximum rows per request
+
+
+TAKES_MAX_CHARS = {"lmsys", "norobots"}
+DEFAULT_DATASETS = ["gsm8k", "mbpp", "norobots"]  # lmsys-chat-1m still selectable with --datasets
 
 
 def sample(name, count, rng, fetch, max_chars, full_scan_rows):
@@ -122,7 +146,7 @@ def sample(name, count, rng, fetch, max_chars, full_scan_rows):
     def usable(entry):
         if entry.get("truncated_cells"):
             return None  # an oversized row comes back cut short; it would not be the real prompt
-        return convert(entry["row"], max_chars) if name == "lmsys" else convert(entry["row"])
+        return convert(entry["row"], max_chars) if name in TAKES_MAX_CHARS else convert(entry["row"])
 
     chosen = []
     if total <= full_scan_rows:
@@ -166,14 +190,14 @@ def sample(name, count, rng, fetch, max_chars, full_scan_rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="task/workload/prompts.jsonl")
-    parser.add_argument("--datasets", nargs="+", default=list(SOURCES), choices=list(SOURCES))
+    parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS, choices=list(SOURCES))
     parser.add_argument("--per-dataset", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--max-chars",
         type=int,
         default=6000,
-        help="lmsys prompts longer than this are drawn again (the runner also caps by tokens)",
+        help="lmsys / norobots prompts longer than this are drawn again (the runner also caps by tokens)",
     )
     parser.add_argument("--pause", type=float, default=1.0, help="seconds between API requests")
     parser.add_argument("--full-scan-rows", type=int, default=5000,
@@ -184,7 +208,7 @@ def main():
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if not token:
-        print("  (no HF_TOKEN: anonymous requests get the lowest rate limit, and lmsys will fail)", file=sys.stderr)
+        print("  (no HF_TOKEN: anonymous requests get the lowest rate limit; lmsys, if asked for, will fail)", file=sys.stderr)
     fetch = Fetcher(token, args.pause)
     prompts, failed = [], []
     if args.keep and os.path.exists(args.out):
