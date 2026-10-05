@@ -131,28 +131,32 @@ server 没有固定 identity,**每次重启 peer ID 都会变**;脚本按节点�
 
 ```bash
 source ~/petals-env.sh                      # 一定要先加载;否则 MODEL_NAME 回落到 Qwen3.6
-S=~/wl-results/<日期>/r4_2048_norobots/settings
+R=~/wl-results/2026-10-05/r4_2048_norobots   # 要复现的那一轮
 
-# 1. 放置:如果 hosts.txt 或层号变过,恢复后重装服务并重启(peer ID 会变,无妨)
-diff $S/config/hosts.txt task/hosts.txt || {
-  cp $S/config/hosts.txt task/hosts.txt
-  bash examples/qwen_cluster.sh service install
-  bash examples/qwen_cluster.sh service restart
-}
-bash examples/qwen_cluster.sh peers         # 层号应和 $S/cluster/peers.txt 一致(peer ID 不必一致)
-
-# 2. 题目:用归档的文件,并核对
-cp $S/prompts/prompts.jsonl $S/prompts/chain.A.jsonl $S/prompts/chain.B.jsonl task/workload/
-(cd task/workload && grep -E ' (prompts|chain\.[AB])\.jsonl$' $S/prompts/MD5SUMS | md5sum -c)
-bash examples/qwen_cluster.sh deploy        # 把题目和脚本同步到各节点
-
-# 3. 跑(约 2.5 小时),结果和新的设置快照都写进 ~/wl-results/<今天>/<name>/
-bash examples/workload_run.sh --name r5_2048 --max-new-tokens 2048
+# 一条命令:恢复放置和题目、核对,然后照原样跑(约 2.5 小时)
+bash examples/workload_run.sh --restore-from $R --name r5_2048 --max-new-tokens 2048
 ```
 
-先想试一下流程:`bash examples/workload_run.sh --name smoke --max-new-tokens 64 -- --limit 3`。
+`--restore-from` 做的事:
 
-复现时对照 `$S/cluster/nodes.txt` 里每台的 `server command` 和 `versions`:server 参数或软件版本不一样,结果就不可比。
+1. 把那一轮的 `hosts.txt` 放回 `task/hosts.txt`(原文件备份成 `hosts.txt.bak-<时间>`)
+2. 把那一轮的 `prompts.jsonl`、`chain.A/B.jsonl` 放回 `task/workload/`,有变化就 `deploy`
+   (用归档的文件,不重新抽样:Hub 上的数据集可能更新)
+3. 放置和快照不一致时:`service install` + `service restart`,然后每 30 s 检查一次,
+   直到每个钉死的节点都以**新的 peer ID** 服务**记录的层号**、并且 swarm 可用(最多等 20 分钟)
+4. 已经一致就不重启,直接往下跑
+
+加 `--pin-all`:3 台 T4 也钉到快照里它们当时的层号,15 台和那一轮完全相同(逐台核对);
+不加则和当时一样只钉 12 台,T4 自动放置(不在测试链上,不影响结果)。
+只想恢复、不跑:加 `--restore-only`。
+
+不带 `--restore-from` 时,`workload_run.sh` 也会先核对 `hosts.txt` 里每个钉死节点的实际层号,
+对不上就拒绝运行。
+
+先想试一下流程:`bash examples/workload_run.sh --restore-from $R --name smoke --max-new-tokens 64 -- --limit 3`。
+
+复现时对照 `$R/settings/cluster/nodes.txt` 里每台的 `server command` 和 `versions`:
+server 参数或软件版本不一样,结果就不可比。
 
 ## 10. 踩过的坑
 
