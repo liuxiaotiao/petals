@@ -626,6 +626,9 @@ Petals 自己的路由代码里也写死了 `overhead_delay = 0.018`(序列化�
 
 ## 8. 真实负载:逐条回放 GSM8K / MBPP / No Robots
 
+> 完整操作流程(复现、看结果、收尾、做新实验、排错)见 [workload-runbook.md](workload-runbook.md);
+> 一键入口 `bash examples/workload_repro.sh all`。
+
 第 7 节一直用同一条合成 prompt,量的是容量。这一节换成真实分布的 prompt,回答另一个问题:
 **一个用户在空闲的链上,实际等多久。**
 
