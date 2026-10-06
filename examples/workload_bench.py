@@ -96,15 +96,20 @@ def run(args):
     from petals import AutoDistributedModelForCausalLM
 
     dtypes = {name: getattr(torch, name) for name in DTYPE_NAMES}
-    prompts = [json.loads(line) for line in open(args.prompts, encoding="utf-8") if line.strip()]
-    if args.shard:
+    # --worker: prompts arrive one at a time on stdin from workload_dispatch.py, which hands
+    # the next one to whichever chain finishes first; otherwise the whole list is known now.
+    prompts = None if args.worker else [
+        json.loads(line) for line in open(args.prompts, encoding="utf-8") if line.strip()]
+    if args.worker:
+        pass
+    elif args.shard:
         index, count = map(int, args.shard.split("/"))
         prompts = prompts[index::count]
-    if args.only_failed:
+    if args.only_failed and not args.worker:
         retry = failed_ids(args.only_failed)
         prompts = [p for p in prompts if p["id"] in retry]
         say(f"--only-failed: {len(prompts)} prompts failed in {' '.join(args.only_failed)}")
-    if args.limit:
+    if args.limit and not args.worker:
         prompts = prompts[: args.limit]
 
     say("loading tokenizer and the client-side layers ...")
@@ -125,7 +130,8 @@ def run(args):
         * getattr(config, "head_dim", config.hidden_size // config.num_attention_heads) * 2  # fp16 on servers
     )
     meta = dict(
-        tag=args.tag, model=args.model, prompts=args.prompts, requests=len(prompts),
+        tag=args.tag, model=args.model, prompts="stdin (shared queue)" if args.worker else args.prompts,
+        requests=None if args.worker else len(prompts),
         max_new_tokens=args.max_new_tokens, max_prompt_tokens=args.max_prompt_tokens, thinking=args.thinking,
         allowed_servers=["…" + peer[-6:] for peer in args.allowed_servers or []],
         kv_bytes_per_token=kv_bytes_per_token, active_params=args.active_params,
@@ -137,8 +143,23 @@ def run(args):
     warm = torch.tensor([tokenizer.encode(render(tokenizer, [{"role": "user", "content": "Hi"}], args.thinking))])
     run_one(model, warm, 2, eos, pad_id, torch)
 
+    def incoming():
+        if not args.worker:
+            yield from enumerate(prompts, 1)
+            return
+        number = 0
+        while True:
+            say("WORKER READY")  # the dispatcher answers with one prompt, or closes stdin when done
+            line = sys.stdin.readline()
+            if not line:
+                return
+            if line.strip():
+                number += 1
+                yield number, json.loads(line)
+
+    total = "?" if args.worker else len(prompts)
     records, started = [], time.time()
-    for number, prompt in enumerate(prompts, 1):
+    for number, prompt in incoming():
         ids = torch.tensor([tokenizer.encode(render(tokenizer, prompt["messages"], args.thinking))])
         record = dict(tag=args.tag, id=prompt["id"], dataset=prompt["dataset"], prompt_tokens=ids.shape[1],
                       submitted=round(time.time(), 3))
@@ -168,7 +189,7 @@ def run(args):
         records.append(record)
         status = record.get("error") or record.get("skipped") or (
             f"TTFT {record['ttft']:.2f}s, {record['output_tokens']} tokens in {record['latency']:.1f}s")
-        say(f"[{number}/{len(prompts)}] {prompt['id']}: {status}")
+        say(f"[{number}/{total}] {prompt['id']}: {status}")
 
     try:
         import resource
@@ -361,6 +382,8 @@ def main():
     parser.add_argument("--thinking", action="store_true", help="let Qwen3 think first (much longer answers)")
     parser.add_argument("--only-failed", nargs="+", metavar="LOG",
                         help="rerun only the requests that failed in these logs; report old and new logs together")
+    parser.add_argument("--worker", action="store_true",
+                        help="read prompts one per line from stdin (workload_dispatch.py) instead of --prompts")
     parser.add_argument("--limit", type=int, default=None, help="only the first N prompts (a smoke test)")
     parser.add_argument("--shard", default=None, metavar="I/N", help="every N-th prompt starting at I")
     parser.add_argument("--request-timeout", type=float, default=1800)

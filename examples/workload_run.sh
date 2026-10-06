@@ -23,6 +23,11 @@
 # --pin-all           also pin the auto-placed nodes (the T4s) to the layers they served in
 #                     the snapshot, so all 15 nodes match, not only the 12 on the chains.
 # --restore-only      restore and verify, then stop without running.
+# --shared            one queue for all chains instead of a fixed split: every chain takes the
+#                     next prompt from task/workload/prompts.jsonl as soon as it is free
+#                     (examples/workload_dispatch.py), so a faster chain runs more of them, each
+#                     prompt still runs once, and the chains finish at about the same time.
+#                     Without it each chain runs its own chain.<TAG>.jsonl, as on 2026-10-05.
 # Without --restore-from the run still checks that every pinned node in hosts.txt serves the
 # layers written there, and refuses to start otherwise.
 #
@@ -35,7 +40,7 @@
 # on one chain double the load and, sharing a log name, overwrite each other's records.
 set -u
 
-name="" max_new=2048 extra=() restore="" pin_all=0 restore_only=0
+name="" max_new=2048 extra=() restore="" pin_all=0 restore_only=0 shared=0
 CHAINS="${CHAINS:-A:N01,N05,N03,N07,N02,N06 B:N11,N08,N09,N13,N04,N10}"
 PROMPT_DIR="${PROMPT_DIR:-task/workload}"
 RESULTS="${RESULTS:-$HOME/wl-results}"
@@ -46,7 +51,7 @@ SSH_PORT="${SSH_PORT:-22}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
 REMOTE_DIR="${REMOTE_DIR:-petals-qwen}"
 
-usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while (( $# )); do
   case "$1" in
     --name) name="${2:-}"; shift 2 ;;
@@ -54,6 +59,7 @@ while (( $# )); do
     --restore-from) restore="${2:-}"; shift 2 ;;
     --pin-all) pin_all=1; shift ;;
     --restore-only) restore_only=1; shift ;;
+    --shared) shared=1; shift ;;
     --) shift; extra=("$@"); break ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
@@ -193,12 +199,24 @@ for spec in $CHAINS; do
   tag="${spec%%:*}" nodes="${spec#*:}"; first="${nodes%%,*}"
   [[ -n "${IP[$first]:-}" ]] || { echo "unknown node $first (not in $HOSTS_FILE)" >&2; exit 2; }
   rsh "${IP[$first]}" "pgrep -f 'workload_bench[.]py'" >/dev/null 2>&1 && busy+=" $first"
+  # The client code itself must be what is here: an old copy silently measures differently.
+  here=$(md5sum < examples/workload_bench.py | cut -c1-32)
+  there=$(rsh "${IP[$first]}" "md5sum < $REMOTE_DIR/repo/examples/workload_bench.py" 2>/dev/null | cut -c1-32)
+  [[ "$here" == "$there" ]] || { echo "examples/workload_bench.py on $first differs from this copy: run 'bash examples/qwen_cluster.sh deploy'" >&2; exit 2; }
+  (( shared )) && continue  # shared queue: prompts are sent from here, nothing to check on the node
   file="$PROMPT_DIR/chain.$tag.jsonl"
   [[ -s "$file" ]] || { echo "missing $file: run examples/workload_split.py first" >&2; exit 2; }
   here=$(md5sum < "$file" | cut -c1-32)
   there=$(rsh "${IP[$first]}" "md5sum < $REMOTE_DIR/repo/$file" 2>/dev/null | cut -c1-32)
   [[ "$here" == "$there" ]] || { echo "$file on $first differs from this copy: run 'bash examples/qwen_cluster.sh deploy'" >&2; exit 2; }
 done
+if (( shared )); then
+  [[ -s "$PROMPT_DIR/prompts.jsonl" ]] || { echo "missing $PROMPT_DIR/prompts.jsonl" >&2; exit 2; }
+  grep -q remote_stdin examples/qwen_cluster.sh \
+    || { echo "examples/qwen_cluster.sh cannot feed a client on stdin (CLIENT_STDIN); update it" >&2; exit 2; }
+  grep -q -- '--worker' examples/workload_bench.py \
+    || { echo "examples/workload_bench.py has no --worker mode; update it" >&2; exit 2; }
+fi
 [[ -z "$busy" ]] || { echo "a workload client is already running on:$busy -- stop it first" >&2; exit 1; }
 
 peers=$(bash examples/qwen_cluster.sh peers 2>&1)
@@ -223,6 +241,7 @@ bash examples/workload_snapshot.sh "$out/settings" > "$out/snapshot.log" 2>&1 \
 {
   echo "name=$name"
   echo "max_new_tokens=$max_new"
+  echo "mode=$( (( shared )) && echo "shared queue ($PROMPT_DIR/prompts.jsonl)" || echo "split ($PROMPT_DIR/chain.<TAG>.jsonl)")"
   echo "chains=$CHAINS"
   echo "client_args=${extra[*]:-}"
   echo "restored_from=${restore:-}${restore:+ (pin_all=$pin_all)}"
@@ -232,19 +251,33 @@ bash examples/workload_snapshot.sh "$out/settings" > "$out/snapshot.log" 2>&1 \
 
 bash examples/cluster_gpumon.sh "$out/gpu.csv" 2> "$out/gpumon.log" &
 gpu=$!
-pids=()
-for spec in $CHAINS; do
-  tag="${spec%%:*}"
-  # ALLOW is deliberately unquoted: each peer ID is its own argument.
-  CLIENT_SCRIPT=workload_bench.py bash examples/qwen_cluster.sh client --node "${CLIENT[$tag]}" \
-    --prompts "$PROMPT_DIR/chain.$tag.jsonl" --allowed-servers ${ALLOW[$tag]} --tag "$tag" \
-    --max-new-tokens "$max_new" ${extra[@]+"${extra[@]}"} > "$out/wl.$tag.log" 2>&1 &
-  pids+=($!)
-  echo "chain $tag: client on ${CLIENT[$tag]}, $(wc -l < "$PROMPT_DIR/chain.$tag.jsonl") prompts, log $out/wl.$tag.log"
-done
+if (( shared )); then
+  chain_args=()
+  for spec in $CHAINS; do
+    tag="${spec%%:*}"
+    # ALLOW is deliberately unquoted: each peer ID is its own argument.
+    chain_args+=(--chain "$tag" "${CLIENT[$tag]}" ${ALLOW[$tag]})
+    echo "chain $tag: worker on ${CLIENT[$tag]}, log $out/wl.$tag.log"
+  done
+  echo "running $(grep -c . "$PROMPT_DIR/prompts.jsonl") prompts from one shared queue; progress below and in $out/dispatch.log"
+  python3 -u examples/workload_dispatch.py --prompts "$PROMPT_DIR/prompts.jsonl" --out "$out" "${chain_args[@]}" \
+    -- --max-new-tokens "$max_new" ${extra[@]+"${extra[@]}"} > >(tee "$out/dispatch.log") 2>&1 &
+  pids=($!)
+else
+  pids=()
+  for spec in $CHAINS; do
+    tag="${spec%%:*}"
+    # ALLOW is deliberately unquoted: each peer ID is its own argument.
+    CLIENT_SCRIPT=workload_bench.py bash examples/qwen_cluster.sh client --node "${CLIENT[$tag]}" \
+      --prompts "$PROMPT_DIR/chain.$tag.jsonl" --allowed-servers ${ALLOW[$tag]} --tag "$tag" \
+      --max-new-tokens "$max_new" ${extra[@]+"${extra[@]}"} > "$out/wl.$tag.log" 2>&1 &
+    pids+=($!)
+    echo "chain $tag: client on ${CLIENT[$tag]}, $(wc -l < "$PROMPT_DIR/chain.$tag.jsonl") prompts, log $out/wl.$tag.log"
+  done
+  echo "running; progress: grep -c '^REC' $out/wl.*.log"
+fi
 trap 'echo "interrupted; stopping clients and gpumon" >&2; kill "${pids[@]}" "$gpu" 2>/dev/null; exit 130' INT TERM
 trap 'rm -rf "$work"' EXIT
-echo "running; progress: grep -c '^REC' $out/wl.*.log"
 wait "${pids[@]}"
 kill "$gpu" 2>/dev/null; wait "$gpu" 2>/dev/null
 echo "finished=$(date -Is)" >> "$out/RUN.txt"
@@ -258,5 +291,6 @@ gpu_arg=()
   cat "$out"/wl.*.log | grep -o '"stop": "[a-z]*"' | sort | uniq -c
   echo "records per chain:"
   grep -c '^REC' "$out"/wl.*.log
+  [[ -f "$out/DISPATCH.txt" ]] && { echo; grep -v '^  ran:' "$out/DISPATCH.txt"; }
 } 2>&1 | tee "$out/REPORT.txt"
 echo "all results and settings: $out"

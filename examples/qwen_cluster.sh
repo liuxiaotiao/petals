@@ -137,6 +137,10 @@ remote() {  # remote <ip> <shell-command>
   $SSH -n $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@$1" "$2"
 }
 
+remote_stdin() {  # like remote, but stdin stays connected: for a client fed on stdin (CLIENT_STDIN=1)
+  $SSH $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@$1" "$2"
+}
+
 # Run one command on every host at once; report which hosts failed.
 # Print nothing when MODEL_NAME was set on purpose; speak up when it was not.
 # The variables that change what the servers do and say nothing when they are missing.
@@ -1271,7 +1275,11 @@ cmd_client() {
   echo "Running the client on $node (${IPS[$i]}) ..."
   # PETALS_MAX_RETRIES: the client's default retry budget behaves as unlimited on this
   # path, so a real failure shows up as an endless wait instead of a traceback.
-  remote "${IPS[$i]}" "
+  # CLIENT_STDIN=1 keeps stdin connected (remote() detaches it): workload_dispatch.py feeds
+  # prompts one at a time to a `workload_bench.py --worker` client through it.
+  local run_remote=remote
+  [[ "${CLIENT_STDIN:-0}" == 1 ]] && run_remote=remote_stdin
+  "$run_remote" "${IPS[$i]}" "
 cd '$REMOTE_DIR/repo'
 HF_HUB_DISABLE_XET='${HF_HUB_DISABLE_XET:-1}' \
 PETALS_MAX_RETRIES='${PETALS_MAX_RETRIES:-3}' \
