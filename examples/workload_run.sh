@@ -8,6 +8,9 @@
 #   bash examples/workload_run.sh --name r5_2048 --max-new-tokens 2048
 #   bash examples/workload_run.sh --name smoke --max-new-tokens 64 --limit 4
 #
+#   # repeat an earlier run exactly: its placement, prompts, mode, chains and limits
+#   bash examples/workload_run.sh --replay ~/wl-results/2026-10-06/r5_shared_2048 --name r6_shared_2048
+#
 #   # rerun on the exact placement and prompts of an earlier run:
 #   bash examples/workload_run.sh --restore-from ~/wl-results/2026-10-05/r4_2048_norobots \
 #        --name r5_2048 --max-new-tokens 2048
@@ -16,6 +19,10 @@
 # Arguments after "--" go to every workload_bench.py client unchanged.
 # Run it inside tmux: a full run is 2-3 hours.
 #
+# --replay DIR        repeat the run recorded in DIR: implies --restore-from DIR and takes
+#                     max_new_tokens, --shared or not, --limit, the chains and the client args
+#                     from DIR/RUN.txt. Any of those given on the command line wins. Only
+#                     --name (a new one) is required.
 # --restore-from DIR  takes a run directory (or its settings/ snapshot). It puts back that
 #                     run's hosts.txt and prompt files; if the placement differs, it reinstalls
 #                     the services, restarts every server and waits until each pinned node
@@ -28,6 +35,7 @@
 #                     (examples/workload_dispatch.py), so a faster chain runs more of them, each
 #                     prompt still runs once, and the chains finish at about the same time.
 #                     Without it each chain runs its own chain.<TAG>.jsonl, as on 2026-10-05.
+# --split             the fixed split explicitly (overrides a replayed --shared).
 # Without --restore-from the run still checks that every pinned node in hosts.txt serves the
 # layers written there, and refuses to start otherwise.
 #
@@ -40,7 +48,8 @@
 # on one chain double the load and, sharing a log name, overwrite each other's records.
 set -u
 
-name="" max_new=2048 extra=() restore="" pin_all=0 restore_only=0 shared=0 limit=""
+name="" max_new="" extra=() extra_given=0 restore="" pin_all=0 restore_only=0 shared="" limit="" replay=""
+chains_from_env=${CHAINS:+1}
 CHAINS="${CHAINS:-A:N01,N05,N03,N07,N02,N06 B:N11,N08,N09,N13,N04,N10}"
 PROMPT_DIR="${PROMPT_DIR:-task/workload}"
 RESULTS="${RESULTS:-$HOME/wl-results}"
@@ -51,7 +60,7 @@ SSH_PORT="${SSH_PORT:-22}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
 REMOTE_DIR="${REMOTE_DIR:-petals-qwen}"
 
-usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while (( $# )); do
   case "$1" in
     --name) name="${2:-}"; shift 2 ;;
@@ -60,12 +69,31 @@ while (( $# )); do
     --pin-all) pin_all=1; shift ;;
     --restore-only) restore_only=1; shift ;;
     --shared) shared=1; shift ;;
+    --split) shared=0; shift ;;
+    --replay) replay="${2:-}"; shift 2 ;;
     --limit) limit="${2:-}"; shift 2 ;;  # a smoke test: N prompts per chain (split) or in total (shared)
-    --) shift; extra=("$@"); break ;;
+    --) shift; extra=("$@"); extra_given=1; break ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
+if [[ -n "$replay" ]]; then
+  [[ -f "$replay/RUN.txt" ]] || { echo "$replay/RUN.txt not found: --replay needs a directory written by workload_run.sh" >&2; exit 2; }
+  recorded() { sed -n "s/^$1=//p" "$replay/RUN.txt" | head -1; }
+  [[ -n "$restore" ]] || restore="$replay"
+  [[ -n "$max_new" ]] || max_new=$(recorded max_new_tokens)
+  if [[ -z "$shared" ]]; then
+    case "$(recorded mode)" in shared*) shared=1 ;; *) shared=0 ;; esac
+  fi
+  if [[ -z "$limit" ]]; then
+    limit=$(recorded limit); [[ "$limit" == none ]] && limit=""
+  fi
+  [[ -n "$chains_from_env" ]] || { rc=$(recorded chains); [[ -n "$rc" ]] && CHAINS="$rc"; }
+  if (( ! extra_given )); then read -r -a extra <<< "$(recorded client_args)"; fi
+  echo "replaying $replay: max_new_tokens=$max_new, $( (( shared )) && echo shared queue || echo fixed split)," \
+       "limit=${limit:-none}, chains=$CHAINS${extra[*]:+, client args: ${extra[*]}}"
+fi
+max_new="${max_new:-2048}" shared="${shared:-0}"
 (( restore_only )) && [[ -z "$restore" ]] && { echo "--restore-only needs --restore-from" >&2; exit 2; }
 (( pin_all )) && [[ -z "$restore" ]] && { echo "--pin-all needs --restore-from" >&2; exit 2; }
 [[ -n "$name" ]] || (( restore_only )) || usage
@@ -247,6 +275,7 @@ bash examples/workload_snapshot.sh "$out/settings" > "$out/snapshot.log" 2>&1 \
   echo "client_args=${extra[*]:-}"
   echo "limit=${limit:-none}"
   echo "restored_from=${restore:-}${restore:+ (pin_all=$pin_all)}"
+  echo "replay_of=${replay:-}"
   for tag in "${!ALLOW[@]}"; do echo "allowed_servers_$tag=${ALLOW[$tag]}"; done
   echo "started=$(date -Is)"
 } > "$out/RUN.txt"
@@ -261,7 +290,8 @@ if (( shared )); then
     chain_args+=(--chain "$tag" "${CLIENT[$tag]}" ${ALLOW[$tag]})
     echo "chain $tag: worker on ${CLIENT[$tag]}, log $out/wl.$tag.log"
   done
-  echo "running $(grep -c . "$PROMPT_DIR/prompts.jsonl") prompts from one shared queue; progress below and in $out/dispatch.log"
+  queued=$(grep -c . "$PROMPT_DIR/prompts.jsonl"); [[ -n "$limit" ]] && (( limit < queued )) && queued=$limit
+  echo "running $queued prompts from one shared queue; progress below and in $out/dispatch.log"
   python3 -u examples/workload_dispatch.py --prompts "$PROMPT_DIR/prompts.jsonl" --out "$out" \
     ${limit:+--limit "$limit"} "${chain_args[@]}" \
     -- --max-new-tokens "$max_new" ${extra[@]+"${extra[@]}"} > >(tee "$out/dispatch.log") 2>&1 &

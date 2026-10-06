@@ -128,7 +128,8 @@ server 没有固定 identity,**每次重启 peer ID 都会变**;脚本按节点�
 | `r1_256_lmsys` | 256 token,第三类是 lmsys-chat-1m 第一条用户消息,每条链跑全部 150 条 | 有效;22 条因 max_batch_size 256 失败,改 2048 后补跑 |
 | `r2_1024_INVALID_two_clients` | 1024 token | **作废**:每条链同时有两个 client,日志互相覆盖 |
 | `r3_1024_norobots` | 1024 token,本文的题集和分链 | 有效;2 条写满 1024 |
-| `r4_2048_norobots` | 2048 token,本文的题集和分链 | **最终结果** |
+| `r4_2048_norobots` | 2048 token,本文的题集和分链 | 固定平分的最终结果 |
+| `r5_shared_2048`(2026-10-06) | 同上,但两条链共用一个队列 | **之后的标准设置**,见 [2026-10-06-shared-queue.md](2026-10-06-shared-queue.md) |
 
 ## 9. 复现
 
