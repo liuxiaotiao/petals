@@ -4,7 +4,21 @@
 同样的 client 设置;**唯一的区别是分配方式**:r4 固定平分(每链 75 条),r5 两条链共用一个队列,
 哪条链空了就取下一条,每条题只跑一次。目的:两条链同时结束,不让快的链干等。
 
-**这是目前的标准设置。** 复现:
+**这是目前的标准设置。** 一键使用(`examples/workload_repro.sh`,默认就是 r5;在 tmux 里跑):
+
+```bash
+bash examples/workload_repro.sh all      # 拉起 server(同一放置、同一模型版本 ad44e777…)→ 等权重就绪 → 核对 → 复现
+bash examples/workload_repro.sh smoke    # 先试 6 条、64 token
+bash examples/workload_repro.sh down     # 用完:停服务(systemd)并删各节点权重,会先列出要删的再确认
+```
+
+分步:`up`(拉起并等所有节点就绪,默认最多等 6 小时)、`check`(只核对)、`run [名字]`、`status`。
+换一次运行:`RUN_DIR=~/wl-results/2026-10-05/r4_2048_norobots bash examples/workload_repro.sh all`。
+
+2026-10-06 r5 结束后权重已删除(406 GiB);当时的模型版本记在 `settings/MODEL_REVISION`
+(`ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`),包清单在 `settings/pip-freeze.N01.txt`,venv 保留未动。
+
+底层命令(`workload_repro.sh` 就是按这个顺序调用的):
 
 ```bash
 cd ~/petals && source ~/petals-env.sh
