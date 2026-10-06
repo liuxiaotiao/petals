@@ -185,6 +185,12 @@ def main():
         if chain.lost:
             lines.append(f"  lost (handed over, never answered): {' '.join(chain.lost)}")
         lines.append(f"  ran: {' '.join(chain.ids)}")
+    dataset_of = {p["id"]: p["dataset"] for p in prompts}
+    answered = collections.Counter(dataset_of[i] for c in chains for i in c.ids if i not in c.lost)
+    queued = collections.Counter(p["dataset"] for p in prompts)
+    lines.append("")
+    lines.append("datasets run, all chains together: " + "  ".join(
+        f"{name} {answered[name]}/{queued[name]}" for name in sorted(queued)))
     finishes = [c.finished for c in chains]
     lines.append("")
     lines.append(f"finish spread between chains: {(max(finishes) - min(finishes)) / 60:.1f} min; "

@@ -6,7 +6,7 @@
 #
 #   source ~/petals-env.sh
 #   bash examples/workload_run.sh --name r5_2048 --max-new-tokens 2048
-#   bash examples/workload_run.sh --name smoke --max-new-tokens 64 -- --limit 3
+#   bash examples/workload_run.sh --name smoke --max-new-tokens 64 --limit 4
 #
 #   # rerun on the exact placement and prompts of an earlier run:
 #   bash examples/workload_run.sh --restore-from ~/wl-results/2026-10-05/r4_2048_norobots \
@@ -40,7 +40,7 @@
 # on one chain double the load and, sharing a log name, overwrite each other's records.
 set -u
 
-name="" max_new=2048 extra=() restore="" pin_all=0 restore_only=0 shared=0
+name="" max_new=2048 extra=() restore="" pin_all=0 restore_only=0 shared=0 limit=""
 CHAINS="${CHAINS:-A:N01,N05,N03,N07,N02,N06 B:N11,N08,N09,N13,N04,N10}"
 PROMPT_DIR="${PROMPT_DIR:-task/workload}"
 RESULTS="${RESULTS:-$HOME/wl-results}"
@@ -60,6 +60,7 @@ while (( $# )); do
     --pin-all) pin_all=1; shift ;;
     --restore-only) restore_only=1; shift ;;
     --shared) shared=1; shift ;;
+    --limit) limit="${2:-}"; shift 2 ;;  # a smoke test: N prompts per chain (split) or in total (shared)
     --) shift; extra=("$@"); break ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
@@ -244,6 +245,7 @@ bash examples/workload_snapshot.sh "$out/settings" > "$out/snapshot.log" 2>&1 \
   echo "mode=$( (( shared )) && echo "shared queue ($PROMPT_DIR/prompts.jsonl)" || echo "split ($PROMPT_DIR/chain.<TAG>.jsonl)")"
   echo "chains=$CHAINS"
   echo "client_args=${extra[*]:-}"
+  echo "limit=${limit:-none}"
   echo "restored_from=${restore:-}${restore:+ (pin_all=$pin_all)}"
   for tag in "${!ALLOW[@]}"; do echo "allowed_servers_$tag=${ALLOW[$tag]}"; done
   echo "started=$(date -Is)"
@@ -260,7 +262,8 @@ if (( shared )); then
     echo "chain $tag: worker on ${CLIENT[$tag]}, log $out/wl.$tag.log"
   done
   echo "running $(grep -c . "$PROMPT_DIR/prompts.jsonl") prompts from one shared queue; progress below and in $out/dispatch.log"
-  python3 -u examples/workload_dispatch.py --prompts "$PROMPT_DIR/prompts.jsonl" --out "$out" "${chain_args[@]}" \
+  python3 -u examples/workload_dispatch.py --prompts "$PROMPT_DIR/prompts.jsonl" --out "$out" \
+    ${limit:+--limit "$limit"} "${chain_args[@]}" \
     -- --max-new-tokens "$max_new" ${extra[@]+"${extra[@]}"} > >(tee "$out/dispatch.log") 2>&1 &
   pids=($!)
 else
@@ -270,7 +273,7 @@ else
     # ALLOW is deliberately unquoted: each peer ID is its own argument.
     CLIENT_SCRIPT=workload_bench.py bash examples/qwen_cluster.sh client --node "${CLIENT[$tag]}" \
       --prompts "$PROMPT_DIR/chain.$tag.jsonl" --allowed-servers ${ALLOW[$tag]} --tag "$tag" \
-      --max-new-tokens "$max_new" ${extra[@]+"${extra[@]}"} > "$out/wl.$tag.log" 2>&1 &
+      --max-new-tokens "$max_new" ${limit:+--limit "$limit"} ${extra[@]+"${extra[@]}"} > "$out/wl.$tag.log" 2>&1 &
     pids+=($!)
     echo "chain $tag: client on ${CLIENT[$tag]}, $(wc -l < "$PROMPT_DIR/chain.$tag.jsonl") prompts, log $out/wl.$tag.log"
   done

@@ -87,8 +87,9 @@ server 没有固定 identity,**每次重启 peer ID 都会变**;脚本按节点�
 - `examples/cluster_gpumon.sh` 每 5 s 采一次 15 台的 GPU 显存和利用率
 - 分配方式(r4):固定平分,每条链跑自己的 `chain.<TAG>.jsonl`。链 B 慢约 20–26%,所以它比链 A 晚结束
 - 之后新增 `--shared`(`examples/workload_dispatch.py`):两条链共用一个队列,哪条链空了就从
-  `prompts.jsonl` 取下一条,每条题仍只跑一次,两条链几乎同时结束。代价是每条链分到的题数和题型比例
-  取决于它的速度,不再是 75/75、各 25 条;**复现 r4 时不要加 `--shared`**
+  `prompts.jsonl` 取下一条,每条题仍只跑一次,两条链几乎同时结束。**整体**仍是三类各 50 条
+  (`DISPATCH.txt` 的 `datasets run` 一行核对);每条链分到多少、比例如何取决于它的速度。
+  试跑用 `--limit N`(共享模式下是总共 N 条)。**复现 r4 时不要加 `--shared`**
 - 一条命令完成:`examples/workload_run.sh`(检查有没有残留 client、题目是否已同步、取 peer ID、
   记录设置、启动采样和两个 client、出报告)
 
